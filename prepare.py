@@ -40,7 +40,7 @@ TRAIN_END_DATE = "2019-12-31"    # in-sample boundary (inclusive)
 VAL_START_DATE = "2020-01-01"    # out-of-sample start
 VAL_END_DATE = "2024-12-31"
 
-UNIVERSE_TAG = "sp100_2024"
+UNIVERSE_TAG = os.environ.get("UNIVERSE_TAG", "sp100_2024").strip() or "sp100_2024"
 BARS = "1d"
 
 COST_BPS = 5.0                   # per-side transaction cost, applied to |Δw|
@@ -66,6 +66,19 @@ BOOTSTRAP_CI = 0.90              # 5th / 95th percentile of resampled Sharpe
 BOOTSTRAP_SEED = 20200101        # fixed so the CI is reproducible per-run
 
 TRADING_DAYS_PER_YEAR = 252
+
+# Walk-forward fold definitions. Five non-overlapping 2-year windows spanning
+# 2014–2023. 2010–2013 seeds lookback windows; 2024 is left out so the headline
+# OOS year (2020–2024) is not fully re-used at fold granularity. Exported so
+# `run_backtest` and `walkforward.py` share one source of truth — the fold
+# set is part of the immutable contract, not a per-strategy choice.
+WALKFORWARD_FOLDS: list[tuple[str, str, str]] = [
+    ("fold_2014_2015", "2014-01-01", "2015-12-31"),
+    ("fold_2016_2017", "2016-01-01", "2017-12-31"),
+    ("fold_2018_2019", "2018-01-01", "2019-12-31"),
+    ("fold_2020_2021", "2020-01-01", "2021-12-31"),
+    ("fold_2022_2023", "2022-01-01", "2023-12-31"),
+]
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -560,6 +573,18 @@ def run_backtest(weights: pd.DataFrame, prices: pd.DataFrame) -> dict:
         for year, group in oos_ret.groupby(oos_ret.index.year):
             yearly_sharpe[int(year)] = _sharpe(group)
 
+    # Walk-forward per-fold Sharpes on the full strategy return series. Folds
+    # span 2014–2023 so they partially overlap the headline 2020–2024 OOS
+    # window — that's why the numbers are masked under SHOW_OOS=0 (revealing
+    # them would leak OOS info). A real edge should hold in most folds, not
+    # be driven by one 2-year regime.
+    fold_sharpes: dict[str, float] = {}
+    for name, f_start, f_end in WALKFORWARD_FOLDS:
+        fold_sharpes[name] = _sharpe(strat_daily.loc[f_start:f_end])
+    fold_finite = [s for s in fold_sharpes.values() if np.isfinite(s)]
+    median_fold_sharpe = float(np.median(fold_finite)) if fold_finite else float("nan")
+    min_fold_sharpe = float(min(fold_finite)) if fold_finite else float("nan")
+
     # Block-bootstrap CI on OOS Sharpe: how wide is the noise band around
     # the point estimate? A 0.42 → 0.51 "improvement" often lives inside
     # this interval, so the agent's keep rule tightens to `lo > running_best`.
@@ -606,6 +631,9 @@ def run_backtest(weights: pd.DataFrame, prices: pd.DataFrame) -> dict:
         "backtest_seconds": float(backtest_seconds),
         "status_hint": status_hint,
         "yearly_sharpe": {y: float(s) for y, s in yearly_sharpe.items()},
+        "fold_sharpes": {k: float(v) for k, v in fold_sharpes.items()},
+        "median_fold_sharpe": median_fold_sharpe,
+        "min_fold_sharpe": min_fold_sharpe,
     }
 
 
@@ -625,6 +653,9 @@ def _crash_result(t_start: float, reason: str) -> dict:
         "status_hint": "crash",
         "crash_reason": reason,
         "yearly_sharpe": {},
+        "fold_sharpes": {},
+        "median_fold_sharpe": float("nan"),
+        "min_fold_sharpe": float("nan"),
     }
 
 # ---------------------------------------------------------------------------
@@ -634,29 +665,67 @@ def _crash_result(t_start: float, reason: str) -> dict:
 _OOS_HIDDEN = "<hidden, SHOW_OOS=0>"
 
 
+OOS_LOG_HEADER = [
+    "commit",
+    "oos_sharpe",
+    "oos_sharpe_lo",
+    "oos_sharpe_hi",
+    "is_sharpe",
+    "max_drawdown",
+    "annual_return",
+    "annual_vol",
+    "turnover_annual",
+    "calmar",
+    "num_trades",
+    "status_hint",
+    "yearly_sharpe_json",
+    "median_fold_sharpe",
+    "min_fold_sharpe",
+    "fold_sharpes_json",
+]
+
+
+def _migrate_oos_log_if_needed() -> None:
+    """If OOS_RESULTS_TSV exists with an older header, set it aside so the
+    new run starts a fresh file with OOS_LOG_HEADER. Best-effort; the file
+    is gitignored, so worst-case we lose an audit trail the user can still
+    recover from the `.old` backup.
+    """
+    if not OOS_RESULTS_TSV.exists():
+        return
+    try:
+        # Empty file isn't old-schema — don't pointlessly rotate a 0-byte file
+        # (and worse, clobber the existing .old in doing so).
+        if OOS_RESULTS_TSV.stat().st_size == 0:
+            return
+        with open(OOS_RESULTS_TSV, "r", encoding="utf-8") as f:
+            first = f.readline().rstrip("\n")
+        if first.split("\t") == OOS_LOG_HEADER:
+            return
+        # If a previous .old backup already exists, pick a timestamped suffix
+        # so migrations never destroy prior audit trails.
+        base = OOS_RESULTS_TSV.with_suffix(OOS_RESULTS_TSV.suffix + ".old")
+        backup = base
+        if backup.exists():
+            from datetime import datetime as _dt
+            backup = OOS_RESULTS_TSV.with_suffix(
+                OOS_RESULTS_TSV.suffix + f".old.{_dt.now():%Y%m%d_%H%M%S}"
+            )
+        OOS_RESULTS_TSV.replace(backup)
+    except OSError:
+        pass
+
+
 def _append_oos_log(results: dict) -> None:
     """Append one row of OOS metrics to OOS_RESULTS_TSV (create if missing).
 
     Runs regardless of SHOW_OOS — the reviewer always has the audit trail.
     The schema is fixed and append-only; the agent should not read this
-    file during the experiment loop.
+    file during the experiment loop (log_result.py reads it; that's the
+    one sanctioned consumer).
     """
-    header = [
-        "commit",
-        "oos_sharpe",
-        "oos_sharpe_lo",
-        "oos_sharpe_hi",
-        "is_sharpe",
-        "max_drawdown",
-        "annual_return",
-        "annual_vol",
-        "turnover_annual",
-        "calmar",
-        "num_trades",
-        "status_hint",
-        "yearly_sharpe_json",
-    ]
     try:
+        _migrate_oos_log_if_needed()
         new_file = not OOS_RESULTS_TSV.exists()
         row_vals = [
             _short_commit(),
@@ -672,10 +741,13 @@ def _append_oos_log(results: dict) -> None:
             str(results.get("num_trades", 0)),
             str(results.get("status_hint", "")),
             json.dumps(results.get("yearly_sharpe", {})),
+            f"{results.get('median_fold_sharpe', float('nan')):.6f}",
+            f"{results.get('min_fold_sharpe', float('nan')):.6f}",
+            json.dumps(results.get("fold_sharpes", {})),
         ]
         with open(OOS_RESULTS_TSV, "a", encoding="utf-8", newline="") as f:
             if new_file:
-                f.write("\t".join(header) + "\n")
+                f.write("\t".join(OOS_LOG_HEADER) + "\n")
             f.write("\t".join(row_vals) + "\n")
     except OSError:
         # Logging is best-effort — never let a filesystem hiccup crash a run.
@@ -719,8 +791,20 @@ def print_summary(results: dict) -> None:
         for year in sorted(results.get("yearly_sharpe", {}).keys()):
             val = results["yearly_sharpe"][year]
             print(f"oos_sharpe_{year}:  {val:.6f}")
-    # status_hint is informational only; the agent applies the keep/discard
-    # rule from program.md, which may differ from this hint on edge cases.
+    # Per-fold Sharpes. Folds overlap the 2020–2024 OOS window so the
+    # numbers are masked under SHOW_OOS=0 (revealing them would leak OOS
+    # signal the agent is not supposed to see during the loop). The grader
+    # still reads the real values out of oos_results.tsv.
+    fold_sharpes = results.get("fold_sharpes", {}) or {}
+    for name in sorted(fold_sharpes.keys()):
+        val = fold_sharpes[name]
+        print(f"{name}:  {oos(val, '{:.6f}')}")
+    med = results.get("median_fold_sharpe", float("nan"))
+    mn = results.get("min_fold_sharpe", float("nan"))
+    print(f"median_fold_sharpe: {oos(med, '{:.6f}')}")
+    print(f"min_fold_sharpe:    {oos(mn, '{:.6f}')}")
+    # status_hint is informational only; the grader (log_result.py) applies
+    # the real keep/discard rule.
     print(f"status_hint:      {results['status_hint']}")
 
 # ---------------------------------------------------------------------------

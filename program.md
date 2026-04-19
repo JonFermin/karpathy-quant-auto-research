@@ -33,7 +33,7 @@ Each experiment runs a vectorized daily-equity backtest, wrapped in a **5-minute
 
 **The goal is simple: get the highest `oos_sharpe`, subject to hard constraints on `max_drawdown` (must be ≤ 0.35) and `turnover_annual` (must be ≤ 50.0).** A high Sharpe that violates either constraint is a `discard`, not a `keep`. Note that this is a *constrained* compare, not the monotone compare used in the upstream autoresearch loop: a run with higher Sharpe but a DD violation loses to a lower-Sharpe run that stays inside the box.
 
-**Overfitting discipline.** With 100 experiments, some high-Sharpe results will be luck. Prefer changes with *economic intuition* over parameter sweeps — a 5-line change with a thesis beats a grid-searched 10-hyperparam result. If a change improves OOS Sharpe but you can't articulate *why* the market would pay for that edge, you should be suspicious of it. Log the thesis in the description column with the literal prefix `thesis: ` so `grep '^thesis:' results.tsv` surfaces them for morning review. `log_result.py` enforces this for keep/discard rows.
+**Overfitting discipline.** The 20-trial cap exists because 580 knob-twists is indistinguishable from a random search — by trial N=500, the expected max Sharpe under the null swamps any plausible real edge. Prefer changes with *economic intuition* over parameter sweeps — a 5-line change with a thesis beats a grid-searched 10-hyperparam result. If a change improves OOS Sharpe but you can't articulate *why* the market would pay for that edge, you should be suspicious of it. Log the thesis in the description column with the literal prefix `thesis: ` so `grep '^thesis:' results.tsv` surfaces them for morning review. `log_result.py` enforces this for keep/discard rows.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.05 Sharpe improvement that adds 30 lines of hacky code? Probably not worth it. A 0.05 Sharpe improvement from deleting code? Definitely keep.
 
@@ -60,10 +60,17 @@ oos_sharpe_2021:  0.998877
 oos_sharpe_2022:  1.345678
 oos_sharpe_2023:  1.211223
 oos_sharpe_2024:  1.456789
+fold_2014_2015:   0.612345
+fold_2016_2017:   0.712345
+fold_2018_2019:   0.562345
+fold_2020_2021:   0.982345
+fold_2022_2023:   0.742345
+median_fold_sharpe: 0.712345
+min_fold_sharpe:    0.562345
 status_hint:      keep_eligible
 ```
 
-`oos_sharpe_ci` is a 90% block-bootstrap interval. A 0.03 point-estimate improvement over `running_best` whose CI lower-bound is below `running_best` is almost certainly noise. `oos_sharpe_YYYY` decomposes the headline by year — a strategy whose OOS Sharpe lives entirely in 2020 is very different from one that's flat-per-year.
+`oos_sharpe_ci` is a 90% block-bootstrap interval. A 0.03 point-estimate improvement over `running_best` whose CI lower-bound is below `running_best` is almost certainly noise. `oos_sharpe_YYYY` decomposes the headline by year. The `fold_*` and `median_fold_sharpe`/`min_fold_sharpe` lines are the walk-forward view — a real edge should survive most folds, not depend on one 2-year regime.
 
 Extract the headline metrics from the log file:
 
@@ -75,56 +82,83 @@ If the grep output is empty, the run crashed. `status_hint` is informational —
 
 **Strict honesty mode (`SHOW_OOS=0`).** If you launch the experiment with `SHOW_OOS=0 uv run strategy.py`, OOS-derived lines are masked as `<hidden, SHOW_OOS=0>` in `run.log` and the full metrics go to a side-channel `oos_results.tsv` the reviewer reads in the morning. In this mode: form hypotheses on `is_sharpe`, use `status_hint` for pass/fail, and use `uv run running_best.py` to get a single number for the comparison. Do **not** `cat oos_results.tsv` during the loop — that defeats the whole point.
 
-## Logging results
+## Logging results (the grader, not you, decides the status)
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+You no longer choose `keep` / `discard` / `crash` yourself — the harness does. All you do is state your hypothesis:
 
-The TSV has a header row and 6 columns:
+```
+uv run log_result.py "thesis: short one-line rationale for what I just tried"
+```
+
+`log_result.py` reads `oos_results.tsv` (the harness-owned audit trail), computes the status, writes the row to `results.tsv`, and exits with a code that tells you what to do next.
+
+**Exit codes** — branch the loop on these:
+
+| Code | Meaning                           | What to do |
+|------|-----------------------------------|------------|
+| 0    | row logged; status is on stdout   | Parse `status=keep\|discard` from the last stdout line. `keep` → advance. `discard` → `git reset --hard HEAD~1`. |
+| 2    | description invalid (missing `thesis:` prefix, or contains tab/newline) | Fix the command and rerun — nothing was logged. |
+| 3    | no code change in `strategy.py` since HEAD~1 (AST equality) | You committed a no-op (comment, whitespace, docstring only). `git reset --hard HEAD~1` and try a real change. Nothing was logged. |
+| 4    | trial cap reached (default 20 per branch) | **Stop the loop.** Surface the branch's results.tsv for review. Do not raise the cap without a good reason — 20 is enough to select a real edge if one exists. |
+| 5    | crash row logged (no `oos_results.tsv` row for this commit — the run never reached `print_summary`) | `git reset --hard HEAD~1`. Inspect `run.log`. |
+
+The TSV has a header row and 6 columns — same schema as before, written by the grader:
 
 ```
 commit	oos_sharpe	max_dd	turnover	status	description
 ```
-
-1. git commit hash (short, 7 chars)
-2. `oos_sharpe` achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. `max_drawdown` as a fraction (e.g. 0.1823) — use 0.0 for crashes
-4. `turnover_annual` (e.g. 5.23) — use 0.0 for crashes
-5. status: `keep`, `discard`, or `crash` (lowercase)
-6. short text description of what this experiment tried — include the thesis
 
 Example:
 
 ```
 commit	oos_sharpe	max_dd	turnover	status	description
-a1b2c3d	0.423100	0.1823	5.23	keep	thesis: 12-1 momentum, 12m lookback with 1m skip harvests the momentum anomaly net of short-term reversal
+a1b2c3d	0.423100	0.1823	5.23	keep	thesis: 12-1 momentum — baseline seed
 b2c3d4e	0.512800	0.1902	8.71	keep	thesis: layering a 21d short-term reversal picks up the opposite effect at the short horizon
 c3d4e5f	0.380200	0.1712	4.90	discard	thesis: widening to top quintile dilutes the signal — expected, confirmed
-d4e5f6g	0.000000	0.0000	0.00	crash	attempt vol targeting, divide-by-zero on flat days
+d4e5f6g	0.000000	0.0000	0.00	crash	attempted vol targeting — divide-by-zero on flat days
 ```
 
-Prefer `uv run log_result.py <status> "thesis: ..."` — it reads run.log, formats the row correctly, and rejects keep/discard rows that are missing the `thesis:` prefix.
+**The keep rule (computed by `log_result.py`, not you)** — a run is kept only if ALL of:
+
+- `oos_sharpe > baseline + 0.15 + sr0(N)` (deflation term: expected max Sharpe under the null of no edge given the N trials on this branch)
+- `oos_sharpe_ci_lo > baseline` (90% block-bootstrap lower bound)
+- `median_fold_sharpe > baseline_median_fold + 0.10` (walk-forward robustness)
+- `min_fold_sharpe > 0`
+- `max_drawdown ≤ 0.35`
+- `turnover_annual ≤ 50`
+- `num_trades ≥ 50`
+
+The baseline is the first non-crash row in `results.tsv` — **fixed once seeded**. The bar does not drift upward after each kept row; every subsequent run competes against the same anchor. If nothing clears this bar after 20 trials, that is a legitimate result.
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `quant-research/mar5`).
+The experiment runs on a dedicated branch (e.g. `quant-research/mar5`). You are capped at **20 trials per branch** (default `AUTORESEARCH_TRIAL_CAP=20`). If none of the 20 clears the baseline gate, that is a legitimate outcome — close the branch and report it.
 
-LOOP FOREVER:
+Useful state probes (none of these show you per-run OOS):
+
+```
+uv run running_best.py              # best kept oos_sharpe so far (single number)
+uv run running_best.py --baseline   # the seed row's oos_sharpe
+uv run running_best.py --trials     # rows logged on this branch (cap awareness)
+```
+
+LOOP until the grader exits 4 (trial cap) or the human stops you:
 
 1. Look at the git state: the current branch/commit we're on.
-2. Tune `strategy.py` with an experimental idea by directly hacking the code.
-3. `git commit`
+2. Tune `strategy.py` with an experimental idea by directly hacking the code. Frame the thesis *before* you edit — if you can't articulate why a market would pay for this edge, skip it.
+3. `git commit` — a real code change. Comment/whitespace/docstring-only commits are auto-rejected.
 4. Run the experiment: `uv run strategy.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^oos_sharpe:\|^max_drawdown:\|^turnover_annual:\|^num_trades:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Decide the status using the **keep rule**. Get the current best with `uv run running_best.py` (single number to stderr if no kept rows yet):
-   - `keep` iff: `oos_sharpe > running_best` AND `oos_sharpe_ci_lo > running_best - 0.1` AND `max_drawdown ≤ 0.35` AND `turnover_annual ≤ 50.0` AND `num_trades ≥ 50`
-   - `discard` if the run finished cleanly but fails the keep rule (including when OOS didn't improve, or when the CI lower bound is well below prior best — i.e. the "improvement" is inside the noise band)
-   - `crash` if the grep was empty, any headline metric is NaN/inf, or the harness returned `status_hint=crash` with a `crash_reason`
-8. Record the row in `results.tsv` (NOTE: do not commit the `results.tsv` file — leave it untracked by git)
-9. If `keep`: advance the branch, keeping the git commit.
-10. If `discard` or `crash`: `git reset --hard HEAD~1` back to where you started.
+5. `grep "^oos_sharpe:\|^max_drawdown:\|^turnover_annual:\|^num_trades:" run.log` — if empty, the run crashed; `tail -n 50 run.log` to read the trace.
+6. Log the run: `uv run log_result.py "thesis: <one-line rationale>"`. The grader computes the status; you don't.
+7. Branch on the grader's exit code:
+   - **0** — stdout ends with `status=keep` (advance the branch) or `status=discard` (`git reset --hard HEAD~1`).
+   - **3** — no-op commit. `git reset --hard HEAD~1`. Don't retry the same change.
+   - **4** — trial cap. **Stop**. Summarize `results.tsv` for the human; the loop is done.
+   - **5** — crash row written. `git reset --hard HEAD~1`. Look at `run.log` to learn from the failure before the next attempt.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+You are a completely autonomous researcher. The grader is strict on purpose: it enforces a deflation-aware hurdle that accounts for the N trials you've run, so a "winner" has to actually clear that bar — not just point-estimate-beat the baseline.
+
+**Mindset**: "nothing beat baseline" is the correct answer most of the time on a survivorship-biased 100-name universe. The trial cap is there to stop you before you've peeked so many times that the OOS window stops being OOS. If none of your 20 ideas cleared the gate, don't pad the count with micro-variants of the last near-miss — close the branch and report. Fewer, better hypotheses is the bar; the loop was re-designed to make that mandatory, not optional.
 
 **Timeout**: Each backtest finishes in seconds under normal circumstances; the hard cap inside `run_backtest` is 5 minutes. If a run hangs past that, kill it and treat as crash.
 
@@ -142,6 +176,10 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 Frame each idea with a one-line thesis *before* you run. If the thesis is "I have no idea, just trying stuff," reconsider.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read the baseline in `strategy.py` for new angles, try combining previous near-misses, try more radical changes. The loop runs until the human interrupts you, period.
+**NEVER STOP EARLY**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep. You are autonomous until ONE of three things happens:
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes about a minute (mostly backtest + git overhead) you can run ~60/hour, for ~300+ over an average human sleep. The user then wakes up to a morning of kept experiments to review.
+1. `log_result.py` exits 4 — the trial cap was reached. Summarize `results.tsv` for morning review and stop.
+2. The human interrupts you.
+3. You genuinely cannot think of a defensible hypothesis that isn't a micro-variant of something already tried. In that case, stop and write a one-paragraph summary of what was attempted. Do NOT fabricate a 19th trial just to fill the cap — a shorter branch with honest hypotheses is worth more than 20 knob-twists.
+
+A user might leave you running while they sleep. With a 20-trial cap and ~1 minute per run, the loop is likely to finish in well under an hour — which means they wake up to a clean, complete branch rather than a 580-row churn log. That is the whole point of the redesign.

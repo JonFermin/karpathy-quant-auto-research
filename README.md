@@ -16,6 +16,41 @@ The repo is deliberately kept small and only really has three files that matter:
 
 The metric is **`oos_sharpe`** (out-of-sample annualized Sharpe on the 2020–2024 slice) subject to hard constraints: `max_drawdown ≤ 0.35` and `turnover_annual ≤ 50.0`. Higher Sharpe is better. Constraint-violating runs are force-discarded regardless of Sharpe.
 
+## The baseline
+
+`strategy.py` ships with **12-1 cross-sectional momentum**, the hurdle every experiment has to clear. The code is five lines of real logic:
+
+```python
+mom = prices.pct_change(252).shift(21)      # 12-month return, skip last month
+ranks = mom.rank(axis=1, pct=True)          # rank across the universe each day
+w = (ranks >= 0.9).astype(float)            # long the top 10% of names
+w = w.div(w.sum(axis=1).replace(0, 1), axis=0)  # equal-weight, gross = 1
+w = w.resample("ME").last().reindex(prices.index, method="ffill").fillna(0.0)  # hold monthly
+```
+
+In plain English: **every month, buy the 10 S&P 100 names that went up the most over the last 12 months — ignoring the most recent month — and hold them for a month.** On this harness it lands at OOS Sharpe ≈ 0.92, max drawdown ≈ 0.32, turnover ~6/yr.
+
+### Why 12-1 momentum is the baseline
+
+It's probably the single most-studied anomaly in equities. Jegadeesh & Titman (1993) documented it in US stocks. Asness, Moskowitz & Pedersen (*Value and Momentum Everywhere*, 2013) found the same pattern in 8 asset classes across 40 countries. Fama & French (2012) added it as the fourth factor in their model. It has survived out-of-sample since publication — roughly 30 years of post-discovery live performance — which is rare for a quant signal.
+
+Two broad families of explanation:
+
+- **Behavioral**: investors underreact to news and then gradually chase the trend. Information diffuses slowly across analysts, institutions, and retail, so yesterday's winners keep winning for several months before the crowd fully catches up.
+- **Risk-based**: momentum is compensation for crash risk. The strategy periodically blows up (2009, 2020) — most famously a ~73% drawdown in 2009 for a US long-short version — and investors demand a premium for holding something with that tail.
+
+### Why *skip the last month*
+
+Short-horizon returns (1 day to 1 month) show the **opposite** effect: recent winners tend to pull back and recent losers bounce. Lehmann (1990) and Jegadeesh (1990) documented this short-term reversal. Including the most recent month in a momentum signal contaminates it with reversal and weakens the result. The "12-1" (twelve-month lookback, skip one) convention splits the two effects cleanly.
+
+### What makes it hard to beat here
+
+- **It's the right answer.** Momentum is a real, persistent effect. Most "improvements" a researcher invents are either (a) fitting IS noise or (b) rediscovering an already-present component of the same signal.
+- **SP100 is a narrow, rigged universe.** 100 survivorship-selected large-caps frozen at 2024 means anything you bought in 2010 made it to 2024 — the baseline eats the survivorship premium for free. Adding filters mostly throws away names that also would have survived.
+- **The harness is honest about noise.** The 90% bootstrap CI on OOS Sharpe is wide (often ±0.5). A 0.03–0.10 "improvement" lives inside that band. The keep rule forces the lower CI bound to clear `running_best - 0.1`, which kills most noise wins.
+
+A useful frame: the baseline is not a weak strawman. It's a 30-year-old effect, carefully implemented, running on a universe that flatters it. Beating it with a genuinely new idea is the point of the loop; **most of the time, the correct finding is that you didn't**.
+
 ## Quick start
 
 **Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), internet access for the one-time yfinance download.

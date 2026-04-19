@@ -30,21 +30,16 @@ import pandas as pd
 from prepare import (
     RISK_FREE_ANNUAL,
     TRADING_DAYS_PER_YEAR,
+    WALKFORWARD_FOLDS,
     load_prices,
     strat_returns,
 )
 from strategy import generate_weights
 
-# Five non-overlapping 2-year OOS windows spanning 2014–2023. 2024 is
-# left out so the sole headline-OOS year is not double-counted in the
-# kept row's morning review. 2010–2013 seeds the strategy's lookback.
-FOLDS: list[tuple[str, str, str]] = [
-    ("fold_2014_2015", "2014-01-01", "2015-12-31"),
-    ("fold_2016_2017", "2016-01-01", "2017-12-31"),
-    ("fold_2018_2019", "2018-01-01", "2019-12-31"),
-    ("fold_2020_2021", "2020-01-01", "2021-12-31"),
-    ("fold_2022_2023", "2022-01-01", "2023-12-31"),
-]
+# Single source of truth lives in prepare.py so `run_backtest` and this CLI
+# report identical fold numbers. Re-exported as `FOLDS` for callers that
+# imported the original name.
+FOLDS = WALKFORWARD_FOLDS
 
 
 def _sharpe(r: pd.Series) -> float:
