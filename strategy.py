@@ -41,7 +41,7 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     score = mom / vol
 
     # Selection: top decile of 6-1 risk-adj mom; crash-risk + data-quality filters.
-    ranks = score.rank(axis=1, pct=True)
+    ranks = score.rank(axis=1, pct=True)  # cross-sectional percentile
     skew = rets.rolling(126).skew().shift(21)
     vol_rank = vol.rank(axis=1, pct=True)
     # Crash-risk filter (skew) + data-quality filter (vol not bottom 10pct).
