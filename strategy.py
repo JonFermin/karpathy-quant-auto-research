@@ -38,13 +38,12 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     vol = rets.rolling(126).std().shift(21)
     score = mom / vol
 
-    # Selection: top decile of 6-1 risk-adj mom; crash-risk + data-quality filters.
-    ranks = score.rank(axis=1, pct=True)  # cross-sectional percentile
-    skew = rets.rolling(126).skew().shift(21)  # rolling 126d skew
-    vol_rank = vol.rank(axis=1, pct=True)  # cross-sectional vol percentile
-    # Keep: top decile + skew > -0.5 (crash-risk) + vol_rank > 0.1 (data-quality).
+    # Selection: top decile + skew > -0.5 (crash-risk) + vol_rank > 0.1 (data-quality).
+    ranks = score.rank(axis=1, pct=True)
+    skew = rets.rolling(126).skew().shift(21)
+    vol_rank = vol.rank(axis=1, pct=True)
     keep = (ranks >= 0.9) & (skew > -0.5) & (vol_rank > 0.1)
-    w = keep.astype(float)  # binary, normalize below
+    w = keep.astype(float)
 
     # Normalize rows to gross leverage 1.0.
     row_sum = w.sum(axis=1).replace(0, 1)
