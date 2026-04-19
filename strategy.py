@@ -39,11 +39,9 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     vol = rets.rolling(126).std().shift(21)
     score = mom / vol
 
-    # Top decile by 6-1 risk-adj momentum, excluding names with crash-risk skew.
+    # Top decile by 6-1 risk-adj momentum; filter crash-risk names.
     ranks = score.rank(axis=1, pct=True)
-    # Skew and volatility-regime filter.
     skew = rets.rolling(126).skew().shift(21)
-    # Require vol also rank above min (exclude very stable)
     vol_rank = vol.rank(axis=1, pct=True)
     w = ((ranks >= 0.9) & (skew > -0.5) & (vol_rank > 0.1)).astype(float)
 
