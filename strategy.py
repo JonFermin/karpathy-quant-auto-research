@@ -41,8 +41,11 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
 
     # Top decile by 6-1 risk-adj momentum, excluding names with crash-risk skew.
     ranks = score.rank(axis=1, pct=True)
+    # Skew and volatility-regime filter.
     skew = rets.rolling(126).skew().shift(21)
-    w = ((ranks >= 0.9) & (skew > -0.5)).astype(float)
+    # Require vol also rank above min (exclude very stable)
+    vol_rank = vol.rank(axis=1, pct=True)
+    w = ((ranks >= 0.9) & (skew > -0.5) & (vol_rank > 0.1)).astype(float)
 
     # Normalize each row to gross leverage 1.0 (or 0 if nothing qualifies yet).
     row_sum = w.sum(axis=1).replace(0, 1)
