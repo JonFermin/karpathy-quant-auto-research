@@ -22,11 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
-import signal
-import sys
 import time
-from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
@@ -78,11 +74,10 @@ def load_universe() -> list[str]:
 # Price download + cache
 # ---------------------------------------------------------------------------
 
-def _download_prices(tickers: list[str]) -> pd.DataFrame:
-    """Download adjusted closes via yfinance. Returns date × ticker DataFrame."""
-    import yfinance as yf  # imported lazily — not needed once cache exists
+def _download_batch(tickers: list[str], threads: bool):
+    """Single yfinance call; returns dict of ticker -> Close series."""
+    import yfinance as yf
 
-    print(f"Downloading {len(tickers)} tickers from {START_DATE} to {VAL_END_DATE}...")
     raw = yf.download(
         tickers=tickers,
         start=START_DATE,
@@ -90,25 +85,44 @@ def _download_prices(tickers: list[str]) -> pd.DataFrame:
         interval=BARS,
         auto_adjust=True,
         progress=False,
-        threads=True,
+        threads=threads,
         group_by="ticker",
     )
-
-    # yfinance returns a MultiIndex column frame. Extract 'Close' per ticker.
-    closes = {}
+    closes: dict[str, pd.Series] = {}
     if isinstance(raw.columns, pd.MultiIndex):
         for t in tickers:
             if (t, "Close") in raw.columns:
-                closes[t] = raw[(t, "Close")]
+                s = raw[(t, "Close")].dropna()
+                if len(s):
+                    closes[t] = s
     else:
-        # Single-ticker case
-        closes[tickers[0]] = raw["Close"]
+        s = raw["Close"].dropna() if "Close" in raw.columns else pd.Series(dtype=float)
+        if len(s):
+            closes[tickers[0]] = s
+    return closes
+
+
+def _download_prices(tickers: list[str]) -> pd.DataFrame:
+    """Download adjusted closes via yfinance. Returns date x ticker DataFrame."""
+    print(f"Downloading {len(tickers)} tickers from {START_DATE} to {VAL_END_DATE}...")
+    closes = _download_batch(tickers, threads=True)
+
+    # Retry any missing tickers serially (yfinance's sqlite cache locks under parallelism).
+    missing = [t for t in tickers if t not in closes]
+    if missing:
+        print(f"Retrying {len(missing)} missing tickers serially: {missing}")
+        retry = _download_batch(missing, threads=False)
+        closes.update(retry)
 
     prices = pd.DataFrame(closes)
-    prices.index = pd.to_datetime(prices.index).tz_localize(None)
-    prices = prices.sort_index()
-    # Drop tickers with no data at all
-    prices = prices.dropna(axis=1, how="all")
+    if prices.index.tz is not None:
+        prices.index = prices.index.tz_localize(None)
+    prices.index = pd.to_datetime(prices.index)
+    prices = prices.sort_index().dropna(axis=1, how="all")
+
+    final_missing = [t for t in tickers if t not in prices.columns]
+    if final_missing:
+        print(f"WARNING: no data for {len(final_missing)} tickers (likely delisted): {final_missing}")
     return prices
 
 
@@ -381,8 +395,8 @@ def main():
     print(f"Cache directory: {CACHE_DIR}")
     print(f"Universe: {UNIVERSE_TAG} ({UNIVERSE_JSON.name})")
     prices = load_prices(refresh=args.refresh)
-    print(f"Loaded prices: {prices.shape[0]} rows × {prices.shape[1]} tickers")
-    print(f"Date range:    {prices.index.min().date()} → {prices.index.max().date()}")
+    print(f"Loaded prices: {prices.shape[0]} rows x {prices.shape[1]} tickers")
+    print(f"Date range:    {prices.index.min().date()} -> {prices.index.max().date()}")
     print("Done! Ready to experiment.")
 
 
