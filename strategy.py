@@ -44,7 +44,7 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     above_med = prices > prices.rolling(126).median()
     skew = rets.rolling(126).skew().shift(21)
     non_neg_skew = skew > -0.5
-    w = ((ranks >= 0.9) & above_med & non_neg_skew).astype(float)
+    w = ((ranks >= 0.9) & non_neg_skew).astype(float)
 
     # Normalize each row to gross leverage 1.0 (or 0 if nothing qualifies yet).
     row_sum = w.sum(axis=1).replace(0, 1)
