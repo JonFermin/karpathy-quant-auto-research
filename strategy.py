@@ -47,7 +47,7 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     # Crash-risk filter (skew) + data-quality filter (vol not bottom 10pct).
     # top decile + skew gate + vol-rank gate
     keep = (ranks >= 0.9) & (skew > -0.5) & (vol_rank > 0.1)
-    w = keep.astype(float)
+    w = keep.astype(float)  # binary weights pre-normalization
 
     # Normalize each row to gross leverage 1.0 (or 0 if nothing qualifies yet).
     row_sum = w.sum(axis=1).replace(0, 1)
