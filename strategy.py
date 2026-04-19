@@ -39,9 +39,10 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     vol = rets.rolling(126).std().shift(21)
     score = mom / vol
 
-    # Cross-sectional rank → long the top decile (rank ≥ 0.9), equal-weight.
+    # Top decile AND price above 126d median (positive trend required).
     ranks = score.rank(axis=1, pct=True)
-    w = (ranks >= 0.9).astype(float)
+    above_med = prices > prices.rolling(126).median()
+    w = ((ranks >= 0.9) & above_med).astype(float)
 
     # Normalize each row to gross leverage 1.0 (or 0 if nothing qualifies yet).
     row_sum = w.sum(axis=1).replace(0, 1)
