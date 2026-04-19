@@ -33,8 +33,14 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     # 12-month return, skipping the most recent month (classic 12-1 momentum)
     mom = prices.pct_change(252).shift(21)
 
+    # Risk-adjust: divide momentum by 126d realized vol of daily returns.
+    # Emphasizes smooth winners; noisy high-return names get deflated.
+    rets = prices.pct_change()
+    vol = rets.rolling(126).std().shift(21)
+    score = mom / vol
+
     # Cross-sectional rank → long the top decile (rank ≥ 0.9), equal-weight.
-    ranks = mom.rank(axis=1, pct=True)
+    ranks = score.rank(axis=1, pct=True)
     w = (ranks >= 0.9).astype(float)
 
     # Normalize each row to gross leverage 1.0 (or 0 if nothing qualifies yet).
