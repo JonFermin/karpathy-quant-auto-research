@@ -64,6 +64,7 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     # Scale based on target 12pct vol.
     scale = (0.12 / port_vol).clip(upper=2.0)
     scale = scale.resample("ME").last().reindex(prices.index, method="ffill").fillna(1.0)
+    # Apply scale and return
     w = w.mul(scale, axis=0)
     return w
 
