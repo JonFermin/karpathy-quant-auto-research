@@ -42,7 +42,8 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     w = w.div(row_sum, axis=0)
 
     # Month-end rebalance; hold through the month.
-    w = w.resample("ME").last().reindex(prices.index, method="ffill").fillna(0.0)
+    monthly = w.resample("ME").last()
+    w = monthly.reindex(prices.index, method="ffill").fillna(0.0)
     return w
 
 
