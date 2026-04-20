@@ -100,22 +100,21 @@ If you name a universe in the prompt, the skill picks it up and passes `UNIVERSE
 
 Each kick-off gets its own timestamped worktree (`worktrees/<month><day>-<HHMMSS>`), so two `/autoresearch` invocations in separate Claude Code sessions run concurrently without stepping on each other's `results.tsv` / `oos_results.tsv` / branches.
 
-**The one constraint:** parallel runs must share the same `UNIVERSE_TAG`. The price cache is a single file (`~/.cache/karpathy-quant-auto-research/prices.parquet`) and `prepare.py` does not namespace it by universe — so two concurrent loops on *different* universes would fight over the cache. Run those sequentially and swap the parquet in between (see next section).
+Parallel runs on **different** universes are safe too: `prepare.py` namespaces the cache by `UNIVERSE_TAG` (`prices_sp100_2024.parquet`, `prices_sp500_2024.parquet`, …), so two loops on different universes read from separate files without contention. Same-universe parallel runs just share the cache read-only.
 
 ### Switching universes
 
-`prepare.py` caches prices at a single, universe-agnostic path. To run on a different universe (e.g. after using SP100), you need to either re-download or swap cache files:
+Each universe has its own parquet cache, keyed by `UNIVERSE_TAG`. First run per universe downloads; subsequent runs hit cache.
 
 ```bash
-# one-time, per universe: populate the cache with that universe's prices
-UNIVERSE_TAG=sp500_2024 uv run prepare.py --refresh
+# populate the cache for a universe (one-time per universe)
+UNIVERSE_TAG=sp500_2024 uv run prepare.py
 
-# or — if you have tagged backups lying around:
-cp ~/.cache/karpathy-quant-auto-research/prices.sp500_2024.parquet \
-   ~/.cache/karpathy-quant-auto-research/prices.parquet
+# then launch the loop — the skill reads UNIVERSE_TAG from the prompt
+UNIVERSE_TAG=sp500_2024 /autoresearch
 ```
 
-A simple convention that makes future swaps cheap: keep tagged backups after each download, e.g. `prices.sp100_2024.parquet`, `prices.sp500_2024.parquet`, and `cp` the right one onto `prices.parquet` before launching. The skill will verify the cache shape matches the requested universe's JSON before running.
+Add a new universe by dropping `universe_<tag>.json` at the repo root with a list of tickers, then `UNIVERSE_TAG=<tag> uv run prepare.py`.
 
 ### What the agent does
 

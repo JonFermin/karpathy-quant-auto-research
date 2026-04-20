@@ -19,14 +19,14 @@ Autonomous quant strategy research loop (daily US equities). An agent repeatedly
 
 ```bash
 uv sync                               # install deps
-uv run prepare.py                     # one-time price download → ~/.cache/karpathy-quant-auto-research/prices.parquet
+uv run prepare.py                     # one-time price download → ~/.cache/karpathy-quant-auto-research/prices_<tag>.parquet
 uv run prepare.py --refresh           # force re-download
 uv run strategy.py > run.log 2>&1     # run one backtest (ALWAYS redirect; do not tee/flood context)
 grep "^oos_sharpe:\|^max_drawdown:\|^turnover_annual:\|^num_trades:" run.log
 tail -n 50 run.log                    # inspect stack trace if grep is empty (crash)
 ```
 
-Prices cache lives at `~/.cache/karpathy-quant-auto-research/prices.parquet` (outside the repo).
+Prices cache lives at `~/.cache/karpathy-quant-auto-research/prices_<UNIVERSE_TAG>.parquet` (outside the repo). Each universe gets its own cache file — set `UNIVERSE_TAG=sp500_2024` (or similar) to switch.
 
 ## Experiment loop (from program.md)
 

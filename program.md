@@ -12,7 +12,7 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data loader, backtest engine, evaluation. Do not modify.
    - `strategy.py` — the file you modify. Signal generation → weight panel.
-4. **Verify data exists**: Check that `~/.cache/karpathy-quant-auto-research/prices.parquet` exists. If not, tell the human to run `uv run prepare.py`.
+4. **Verify data exists**: Check that `~/.cache/karpathy-quant-auto-research/prices_<UNIVERSE_TAG>.parquet` exists for the chosen universe (default `sp100_2024`). If not, tell the human to run `UNIVERSE_TAG=<tag> uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 

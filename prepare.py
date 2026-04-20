@@ -86,7 +86,7 @@ WALKFORWARD_FOLDS: list[tuple[str, str, str]] = [
 
 REPO_ROOT = Path(__file__).resolve().parent
 CACHE_DIR = Path.home() / ".cache" / "karpathy-quant-auto-research"
-PRICES_PARQUET = CACHE_DIR / "prices.parquet"
+PRICES_PARQUET = CACHE_DIR / f"prices_{UNIVERSE_TAG}.parquet"
 UNIVERSE_JSON = REPO_ROOT / f"universe_{UNIVERSE_TAG}.json"
 
 # Side-channel OOS log. Every run appends the full result dict here so the

@@ -23,7 +23,7 @@ You start in the repo root (the main checkout). Run these checks in parallel:
 ```bash
 git status
 git rev-parse --abbrev-ref HEAD
-ls ~/.cache/karpathy-quant-auto-research/prices.parquet
+ls ~/.cache/karpathy-quant-auto-research/prices_${UNIVERSE_TAG:-sp100_2024}.parquet
 grep -q '^worktrees/' .gitignore && echo ok || echo "NEEDS worktrees/ in .gitignore"
 ```
 
@@ -37,7 +37,7 @@ Then:
    cd worktrees/<tag>
    ```
    Every subsequent command in the loop runs from **inside the worktree** (`worktrees/<tag>/`). `results.tsv`, `oos_results.tsv`, `run.log`, and the `strategy.py` edits all live there — so parallel experiments never touch each other's state. If the main working tree has uncommitted changes, that's fine (worktrees are independent) — but check that `worktrees/` is in `.gitignore` (see the grep check above). If it isn't, stop and tell the human to add it before proceeding; otherwise `git status` in the main tree will fill with worktree noise.
-3. **Verify prices cache**: if `~/.cache/karpathy-quant-auto-research/prices.parquet` is missing, stop and tell the human to `uv run prepare.py`. Do not try to run it yourself — it re-downloads several MB from yfinance. If the human specified a non-default universe (e.g. "sp500"), also verify the right cache is mounted — see **Universe selection** below.
+3. **Verify prices cache**: if `~/.cache/karpathy-quant-auto-research/prices_<tag>.parquet` is missing for the chosen `UNIVERSE_TAG` (default `sp100_2024`), stop and tell the human to run `UNIVERSE_TAG=<tag> uv run prepare.py`. Do not try to run it yourself — it re-downloads several MB from yfinance. Each universe has its own cache file (`prices_sp100_2024.parquet`, `prices_sp500_2024.parquet`, etc.), so universes can coexist on disk without swapping.
 4. **Seed `results.tsv`** inside the worktree with just the header row (it should be absent in a brand-new worktree):
    ```
    commit	oos_sharpe	max_dd	turnover	status	description
@@ -51,15 +51,14 @@ Then:
 The experiment loop defaults to `UNIVERSE_TAG=sp100_2024`. If the human names a different universe in the launch prompt (e.g. "on SP500", "with UNIVERSE_TAG=sp500_2024"):
 
 - Verify `universe_<tag>.json` exists at the repo root.
-- Verify `~/.cache/karpathy-quant-auto-research/prices.parquet` corresponds to that universe — `prepare.py` does NOT tag the cache file by universe, so the cache on disk might be the previous universe's prices. Check column count roughly matches the universe JSON (e.g. `uv run python -c "import pandas as pd; print(pd.read_parquet('...').shape)"`).
-- If the cache is for the wrong universe, stop and tell the human to either `cp ~/.cache/karpathy-quant-auto-research/prices.<tag>.parquet ~/.cache/karpathy-quant-auto-research/prices.parquet` (if they've preserved a tagged backup — see the multi-universe workflow memory) or `UNIVERSE_TAG=<tag> uv run prepare.py --refresh` to re-download. Do NOT re-download autonomously.
+- Verify `~/.cache/karpathy-quant-auto-research/prices_<tag>.parquet` exists. Each universe has its own cache file — no swapping needed. If missing, stop and tell the human to `UNIVERSE_TAG=<tag> uv run prepare.py` (no `--refresh` needed; fresh filename, no stale cache to fight). Do NOT re-download autonomously.
 - Export `UNIVERSE_TAG=<tag>` on EVERY call to `strategy.py`, `log_result.py`, `running_best.py`, etc. — they all read it at import time.
 
 ### Parallel experiments
 
 Two or more worktrees can run concurrently when each has a unique timestamped tag. But:
 
-- **Parallel runs must share the same `UNIVERSE_TAG`.** The price cache is a single file (`~/.cache/karpathy-quant-auto-research/prices.parquet`); if two loops want different universes, they'll fight over it. Same-universe parallel runs just share the cache read-only, which is safe.
+- Parallel runs on **different** `UNIVERSE_TAG`s are safe — each universe has its own cache file (`prices_<tag>.parquet`) so they don't contend. Same-universe parallel runs share the cache read-only, also safe.
 - Each worktree has its own `results.tsv` / `oos_results.tsv` / `run.log`, so the grader and `running_best.py` see only that worktree's trials — they do NOT pool across parallel experiments. That's intentional: each run is a clean 20-trial branch.
 - Don't reach into a sibling worktree's files from inside your loop. If the human wants to compare across parallel branches, that's a morning-review job.
 
