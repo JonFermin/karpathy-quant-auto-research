@@ -12,4 +12,4 @@ Interpretation:
 - If `$ARGUMENTS` is empty, use the default `UNIVERSE_TAG=sp100_2024`.
 - Any additional words are hints (e.g. "overnight", "strict"); strict-honesty `SHOW_OOS=0` is always on regardless.
 
-Then: follow the `quant-autoresearch` skill end-to-end — create a timestamped worktree at `worktrees/<month-abbrev><day>-<HHMMSS>`, run the full loop, and on graceful exit build `SUMMARY.md`, commit, push to `origin`, and remove the worktree. Do not stop until the grader exits 4 or the human interrupts.
+Then: follow the `quant-autoresearch` skill end-to-end — create a timestamped worktree at `worktrees/MMDD-HHMMSS` (e.g. `worktrees/0419-223742` — numeric, locale-independent), run the full loop, and on graceful exit build `SUMMARY.md`, commit, push to `origin`, and remove the worktree. Do not stop until the grader exits 4 or the human interrupts.

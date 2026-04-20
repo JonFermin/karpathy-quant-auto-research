@@ -5,7 +5,7 @@ description: Use when the user asks to kick off / start / begin a new quant rese
 
 # quant-autoresearch
 
-Kicks off an autonomous quant-strategy experiment loop in this repo per `program.md`. Strict-honesty `SHOW_OOS=0` mode. Runs inside a **dedicated git worktree** on a fresh `quant-research/<tag>` branch, where `<tag>` is **timestamped** (e.g. `apr19-223742`) so two experiments can run in parallel without stomping on each other. Never stops until the grader returns exit 4 (trial cap) or the human interrupts.
+Kicks off an autonomous quant-strategy experiment loop in this repo per `program.md`. Strict-honesty `SHOW_OOS=0` mode. Runs inside a **dedicated git worktree** on a fresh `quant-research/<tag>` branch, where `<tag>` is **timestamped** `MMDD-HHMMSS` (e.g. `0419-223742`) so two experiments can run in parallel without stomping on each other. Numeric tags only — locale-independent and sortable. Never stops until the grader returns exit 4 (trial cap) or the human interrupts.
 
 ## Non-negotiable ground rules (do not violate)
 
@@ -18,7 +18,11 @@ Kicks off an autonomous quant-strategy experiment loop in this repo per `program
 
 ## Step 1 — Setup
 
-You start in the repo root (the main checkout). Run these checks in parallel:
+You start in the repo root (the main checkout).
+
+**First, resolve the universe.** If the launch prompt names a non-default universe (e.g. "on SP500", `UNIVERSE_TAG=sp500_2024`, or `/autoresearch sp500`), `export UNIVERSE_TAG=sp500_2024` **before** any preflight check, any loop command, and any helper invocation. Default is `sp100_2024`. Every helper (`strategy.py`, `log_result.py`, `running_best.py`, `prepare.py`) reads this env var at import time, so the export must persist for the whole session. See "Universe selection" below for the full rules.
+
+Then run these checks in parallel:
 
 ```bash
 git status
@@ -29,22 +33,23 @@ grep -q '^worktrees/' .gitignore && echo ok || echo "NEEDS worktrees/ in .gitign
 
 Then:
 
-1. **Pick a timestamped tag**: `<month-abbrev><day>-<HHMMSS>` from the current local time (e.g. `apr19-223742`). The seconds suffix is what lets two concurrent skill launches coexist — do NOT drop it even if you're the only one running. Verify `git branch --list quant-research/<tag>` is empty; if by some fluke it exists (clock skew, replay), append `b`, `c`, … as a collision bump.
+1. **Pick a timestamped tag and export it**: numeric `MMDD-HHMMSS` from the current local time (e.g. `0419-223742`). Numeric only — locale-independent and sortable. The seconds suffix is what lets two concurrent skill launches coexist — do NOT drop it even if you're the only one running.
+   ```bash
+   TAG=$(date +%m%d-%H%M%S)
+   git branch --list "quant-research/$TAG"   # must be empty; if not, append b/c/d as a collision bump
+   export TAG
+   ```
+   `$TAG` is used throughout the rest of the skill — setup, loop, archive. Do not retype the literal value.
 2. **Create a dedicated worktree on a fresh branch from master**:
    ```bash
    mkdir -p worktrees
-   git worktree add -b quant-research/<tag> worktrees/<tag> master
-   cd worktrees/<tag>
+   git worktree add -b "quant-research/$TAG" "worktrees/$TAG" master
+   cd "worktrees/$TAG"
    ```
-   Every subsequent command in the loop runs from **inside the worktree** (`worktrees/<tag>/`). `results.tsv`, `oos_results.tsv`, `run.log`, and the `strategy.py` edits all live there — so parallel experiments never touch each other's state. If the main working tree has uncommitted changes, that's fine (worktrees are independent) — but check that `worktrees/` is in `.gitignore` (see the grep check above). If it isn't, stop and tell the human to add it before proceeding; otherwise `git status` in the main tree will fill with worktree noise.
+   Every subsequent command in the loop runs from **inside the worktree** (`worktrees/$TAG/`). `results.tsv`, `oos_results.tsv`, `run.log`, and the `strategy.py` edits all live there — so parallel experiments never touch each other's state. If the main working tree has uncommitted changes, that's fine (worktrees are independent) — but check that `worktrees/` is in `.gitignore` (see the grep check above). If it isn't, stop and tell the human to add it before proceeding; otherwise `git status` in the main tree will fill with worktree noise.
 3. **Verify prices cache**: if `~/.cache/karpathy-quant-auto-research/prices_<tag>.parquet` is missing for the chosen `UNIVERSE_TAG` (default `sp100_2024`), stop and tell the human to run `UNIVERSE_TAG=<tag> uv run prepare.py`. Do not try to run it yourself — it re-downloads several MB from yfinance. Each universe has its own cache file (`prices_sp100_2024.parquet`, `prices_sp500_2024.parquet`, etc.), so universes can coexist on disk without swapping.
-4. **Seed `results.tsv`** inside the worktree with just the header row (it should be absent in a brand-new worktree):
-   ```
-   commit	oos_sharpe	max_dd	turnover	status	description
-   ```
-   (tab-separated, no trailing newline weirdness). Do NOT stage or commit it.
-5. **Read context**: `README.md`, `prepare.py`, `strategy.py`. You've already read `program.md` (that's why you're here). Skim `log_result.py` and `running_best.py` only if you need to confirm an exit-code detail — don't re-derive the rules, they're in `program.md`.
-6. **Baseline run FIRST**: do not edit `strategy.py` yet. The very first run of the branch is the baseline commit-free run to seed `oos_results.tsv`. Follow the loop below with a trivial identity-commit path — see "First iteration" note at the bottom.
+4. **Read context** (narrow — don't flood your window): `strategy.py` is ~50 lines, read it in full. `prepare.py` is 800+ lines; do NOT read it whole — `grep` for the specific constant or helper you need (e.g. `grep -n 'TIME_BUDGET_S\|MAX_DRAWDOWN_HARD' prepare.py`). `program.md` you've already read. `README.md`, `log_result.py`, and `running_best.py` only if a specific question arises; don't re-derive their rules from scratch.
+5. **Baseline first**: the very first commit on this branch anchors the permanent baseline. Make a behavior-preserving algebraic rewrite (see "First iteration" note at the bottom) — do NOT put a real idea here. `results.tsv` does not need to be pre-seeded; `log_result.py` writes the header automatically on first append.
 
 ### Universe selection
 
@@ -82,12 +87,20 @@ grep "^is_sharpe:\|^max_drawdown:\|^turnover_annual:\|^num_trades:\|^status_hint
 # If empty → crash. tail -n 50 run.log to read the trace.
 
 # 5. Log the row (grader writes status, not you).
-#    CRITICAL: log_result.py leaks the OOS sharpe on BOTH streams under SHOW_OOS=0:
-#      - stdout "logged: <commit> <oos_sharpe> <max_dd> <turnover> ..." (the row it wrote)
-#      - stderr "grader: <status> (oos_sharpe 0.4231 > hurdle 0.5912 ...)" (the verdict reason)
-#    Mute both and surface only the machine-parseable `status=` trailer.
-out=$(uv run log_result.py "thesis: <one-line rationale>" 2>/dev/null); rc=$?
+#    CRITICAL: log_result.py leaks OOS-sensitive numbers on both streams:
+#      - stdout: "logged: <commit> <oos_sharpe> <max_dd> <turnover> ..." (always written)
+#      - stderr: "grader: <status> (oos_sharpe 0.4231 > hurdle 0.5912 ...)" (exit 0 ONLY)
+#    Mute stdout to a shell var (grep out only the `status=` trailer).
+#    Capture stderr to a file and surface it ONLY on non-zero exit —
+#    exits 2/3/4 print safe diagnostics ("ERROR: trial cap reached", etc.)
+#    that we need to see; exit 0's stderr is the OOS-leaking "grader:" line
+#    and must stay hidden.
+out=$(uv run log_result.py "thesis: <one-line rationale>" 2>_grader.err); rc=$?
 echo "$out" | grep '^status=' || true
+if [ "$rc" -ne 0 ]; then
+  cat _grader.err >&2
+fi
+rm -f _grader.err
 echo "exit=$rc"
 
 # 6. Branch on exit code:
@@ -122,12 +135,20 @@ Do NOT run `cat oos_results.tsv` during the loop. Do NOT `grep oos_sharpe_2` or 
 
 ### First iteration (baseline)
 
-`log_result.py` requires a real code change against `HEAD~1`, so the baseline needs a tiny scaffolding commit to anchor it. Make the first iteration a genuine minimal tweak — e.g. a single-line guard, or a rename of an internal helper. Avoid docstring-only edits: `_strip_docstrings` erases them before the AST diff, so a pure docstring rewrite gets rejected as exit 3 (no-op).
+`log_result.py` requires a real AST-level code change against `HEAD~1` (it strips docstrings before comparing, so docstring/whitespace/comment edits are rejected as exit 3 no-op). The baseline therefore needs a tiny commit that is **AST-different but behavior-identical** — anchoring on pure 12-1 momentum without altering any computed value.
+
+**Recommended recipe: an algebraically-identical numeric rewrite inside `generate_weights`.** Pick one and commit it verbatim:
+
+- `(ranks >= 0.9)` → `(ranks >= 1 - 0.1)` — different AST (`Constant` vs `BinOp`), identical value.
+- `pct_change(252).shift(21)` → `pct_change(252).shift(21 + 0)` — adds a no-op arithmetic node.
+- Introduce an unused local: `_baseline_anchor = 0` at the top of `generate_weights`, then leave everything else untouched.
+
+**Avoid** anything that could shift even one output cell: don't change thresholds (`0.9` → `0.85`), don't reorder operations that might produce different float dust, don't add a "small" guard (a `dropna()` you didn't have before *does* change behavior on edge rows). The goal is a provably identical weight panel with a different AST.
 
 **The first non-crash commit on the branch becomes the permanent baseline anchor.** Every subsequent keep is judged against it, not the running max. That means:
 
-- Your first iteration must be **trivial / strategy-neutral** — do NOT put a real idea in trial #1. If it happens to score well by luck, the hurdle for every later idea is inflated forever.
-- If trial #1 crashes (exit 5 → `git reset --hard HEAD~1`), trial #2 becomes the effective first trial and anchors the baseline. That's fine, but it means you get at most one retry before the anchor is locked — make trial #2 just as neutral as trial #1 was supposed to be.
+- Your first iteration must be **strategy-neutral** — do NOT put a real idea in trial #1. If it happens to score well by luck, the hurdle for every later idea is inflated forever.
+- If trial #1 crashes (exit 5 → `git reset --hard HEAD~1`), trial #2 becomes the effective first trial and anchors the baseline. That's fine, but it means you get at most one retry before the anchor is locked — make trial #2 just as neutral.
 - Do not try to "tune" the baseline by running variants until one feels right. The very first non-crash commit wins.
 
 ## Hypothesis discipline
@@ -154,23 +175,31 @@ On a **graceful** stop (cases 1 and 3 below), run the **Archive + push + cleanup
 `results.tsv` and `oos_results.tsv` are gitignored, so removing the worktree destroys them. The archive step folds their content into a committed `SUMMARY.md` so the branch on origin is self-describing.
 
 ```bash
-# (from inside worktrees/<tag>)
+# (from inside worktrees/$TAG — $TAG exported back in Step 1)
+
+# 0. Compute everything that goes into SUMMARY.md / commit message up-front.
+#    No `<placeholder>` literals should survive past this block — if you see
+#    `<...>` in the committed file, a substitution was missed.
+BRANCH="quant-research/$TAG"
+UNIV="${UNIVERSE_TAG:-sp100_2024 (default)}"
+BASELINE_LINE=$(uv run running_best.py --baseline --verbose 2>/dev/null || echo "n/a")
+RUNNING_LINE=$(uv run running_best.py --verbose 2>/dev/null || echo "no kept rows")
+TRIALS_LINE=$(uv run running_best.py --trials 2>/dev/null || echo "0")
+N_KEEP=$(awk -F'\t' 'NR>1 && $5=="keep" {n++} END {print n+0}' results.tsv)
+N_TRIAL=$(awk -F'\t' 'NR>1              {n++} END {print n+0}' results.tsv)
+STOP_REASON="trial-cap"   # set manually: "trial-cap" | "no-defensible-hypothesis"
 
 # 1. Build SUMMARY.md — capture the full audit trail in a committed file.
 #    Build in pieces (NOT a single unquoted heredoc): thesis strings in results.tsv
 #    are agent-authored and may contain `$(...)`, backticks, or `\` that would be
 #    re-evaluated by bash inside `<<EOF`. Here they pass through cat/awk only.
-baseline_line=$(uv run running_best.py --baseline --verbose 2>/dev/null || echo "n/a")
-running_line=$(uv run running_best.py --verbose 2>/dev/null || echo "no kept rows")
-trials_line=$(uv run running_best.py --trials 2>/dev/null || echo "0")
-
 {
-  printf '# quant-research/<tag>\n\n'
-  printf -- '- **UNIVERSE_TAG**: <tag value, or "sp100_2024 (default)">\n'
-  printf -- '- **Baseline (seed)**: %s\n' "$baseline_line"
-  printf -- '- **Running best**:   %s\n' "$running_line"
-  printf -- '- **Trials logged**:  %s\n' "$trials_line"
-  printf -- '- **Stop reason**:    <trial-cap | no-defensible-hypothesis | …>\n\n'
+  printf '# %s\n\n' "$BRANCH"
+  printf -- '- **UNIVERSE_TAG**: %s\n' "$UNIV"
+  printf -- '- **Baseline (seed)**: %s\n' "$BASELINE_LINE"
+  printf -- '- **Running best**:   %s\n' "$RUNNING_LINE"
+  printf -- '- **Trials logged**:  %s\n' "$TRIALS_LINE"
+  printf -- '- **Stop reason**:    %s\n\n' "$STOP_REASON"
   printf '## results.tsv\n\n'
   printf '```\n'
   cat results.tsv
@@ -184,13 +213,20 @@ trials_line=$(uv run running_best.py --trials 2>/dev/null || echo "0")
   awk -F'\t' 'NR>1 && $5=="crash"   {print "- " $6}' results.tsv
 } > SUMMARY.md
 
+# Sanity-check: no unresolved <...> placeholders snuck through.
+if grep -q '<[a-z-]*>' SUMMARY.md; then
+  echo "ERROR: unresolved <placeholder> in SUMMARY.md — fix before committing"
+  grep -n '<[a-z-]*>' SUMMARY.md
+  exit 1
+fi
+
 # 2. Commit the summary.
 git add SUMMARY.md
-git commit -m "summary: quant-research/<tag> (<n-keep>/<n-trials>)"
+git commit -m "summary: $BRANCH ($N_KEEP/$N_TRIAL)"
 
 # 3. Push the branch — only if a remote exists. Do not force-push.
 if git remote get-url origin >/dev/null 2>&1; then
-  git push -u origin quant-research/<tag> || echo "push failed — leaving worktree in place for manual recovery"
+  git push -u origin "$BRANCH" || echo "push failed — leaving worktree in place for manual recovery"
 else
   echo "no origin remote — skipping push, leaving worktree in place"
 fi
@@ -198,13 +234,13 @@ fi
 # 4. Only remove the worktree if the push succeeded (or no remote was expected).
 #    If push failed, STOP and tell the human — do not silently lose the branch state.
 cd ../..    # back to repo root
-# Exact-match check — `grep -q origin/quant-research/<tag>` would prefix-match a
-# sibling branch (e.g. apr19-2237 vs apr19-223742) and nuke the wrong worktree.
-if git rev-parse --verify --quiet refs/remotes/origin/quant-research/<tag> >/dev/null; then
-  git worktree remove worktrees/<tag>
-  echo "archived and cleaned up: quant-research/<tag> pushed to origin"
+# Exact-match check — `grep -q origin/$BRANCH` would prefix-match a sibling
+# branch (e.g. 0419-2237 vs 0419-223742) and nuke the wrong worktree.
+if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
+  git worktree remove "worktrees/$TAG"
+  echo "archived and cleaned up: $BRANCH pushed to origin"
 else
-  echo "worktree preserved at worktrees/<tag> — manual cleanup required"
+  echo "worktree preserved at worktrees/$TAG — manual cleanup required"
 fi
 ```
 
