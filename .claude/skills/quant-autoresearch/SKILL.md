@@ -1,11 +1,11 @@
 ---
 name: quant-autoresearch
-description: Use when the user asks to kick off / start / begin a new quant research experiment in this repo, run the autonomous strategy loop, or launch an overnight SHOW_OOS=0 run. Triggers on phrases like "kick off a new experiment", "start the autoresearch loop", "run program.md", "launch strict-honesty mode". Drives the program.md loop: edit strategy.py → commit → backtest → log_result.py → keep/discard, on a fresh quant-research/<tag> branch, in strict-honesty SHOW_OOS=0 mode, never stopping until the grader exits 4 or the human interrupts.
+description: Use when the user asks to kick off / start / begin a new quant research experiment in this repo, run the autonomous strategy loop, or launch an overnight SHOW_OOS=0 run. Triggers on phrases like "kick off a new experiment", "start the autoresearch loop", "run program.md", "launch strict-honesty mode". Drives the program.md loop: edit strategy.py → commit → backtest → log_result.py → keep/discard, inside a dedicated git worktree on a fresh quant-research/<tag> branch (timestamped so parallel launches don't collide), in strict-honesty SHOW_OOS=0 mode, never stopping until the grader exits 4 or the human interrupts.
 ---
 
 # quant-autoresearch
 
-Kicks off an autonomous quant-strategy experiment loop in this repo per `program.md`. Strict-honesty `SHOW_OOS=0` mode. Runs on a fresh `quant-research/<tag>` branch. Never stops until the grader returns exit 4 (trial cap) or the human interrupts.
+Kicks off an autonomous quant-strategy experiment loop in this repo per `program.md`. Strict-honesty `SHOW_OOS=0` mode. Runs inside a **dedicated git worktree** on a fresh `quant-research/<tag>` branch, where `<tag>` is **timestamped** (e.g. `apr19-223742`) so two experiments can run in parallel without stomping on each other. Never stops until the grader returns exit 4 (trial cap) or the human interrupts.
 
 ## Non-negotiable ground rules (do not violate)
 
@@ -18,20 +18,27 @@ Kicks off an autonomous quant-strategy experiment loop in this repo per `program
 
 ## Step 1 — Setup
 
-Run these checks in parallel:
+You start in the repo root (the main checkout). Run these checks in parallel:
 
 ```bash
 git status
 git rev-parse --abbrev-ref HEAD
 ls ~/.cache/karpathy-quant-auto-research/prices.parquet
+grep -q '^worktrees/' .gitignore && echo ok || echo "NEEDS worktrees/ in .gitignore"
 ```
 
 Then:
 
-1. **Pick a tag**: propose `<month-abbrev><day>` from today's date (e.g. `apr19`). Verify `git branch --list quant-research/<tag>` is empty. If it exists, bump the tag (`apr19b`, `apr19c`, …).
-2. **Fresh branch from master**: `git checkout master && git checkout -b quant-research/<tag>`. If the working tree has uncommitted changes, stop and tell the human — do not blow them away.
-3. **Verify prices cache**: if `~/.cache/karpathy-quant-auto-research/prices.parquet` is missing, stop and tell the human to `uv run prepare.py`. Do not try to run it yourself — it re-downloads several MB from yfinance.
-4. **Seed `results.tsv`** with just the header row if it is absent or not header-only:
+1. **Pick a timestamped tag**: `<month-abbrev><day>-<HHMMSS>` from the current local time (e.g. `apr19-223742`). The seconds suffix is what lets two concurrent skill launches coexist — do NOT drop it even if you're the only one running. Verify `git branch --list quant-research/<tag>` is empty; if by some fluke it exists (clock skew, replay), append `b`, `c`, … as a collision bump.
+2. **Create a dedicated worktree on a fresh branch from master**:
+   ```bash
+   mkdir -p worktrees
+   git worktree add -b quant-research/<tag> worktrees/<tag> master
+   cd worktrees/<tag>
+   ```
+   Every subsequent command in the loop runs from **inside the worktree** (`worktrees/<tag>/`). `results.tsv`, `oos_results.tsv`, `run.log`, and the `strategy.py` edits all live there — so parallel experiments never touch each other's state. If the main working tree has uncommitted changes, that's fine (worktrees are independent) — but check that `worktrees/` is in `.gitignore` (see the grep check above). If it isn't, stop and tell the human to add it before proceeding; otherwise `git status` in the main tree will fill with worktree noise.
+3. **Verify prices cache**: if `~/.cache/karpathy-quant-auto-research/prices.parquet` is missing, stop and tell the human to `uv run prepare.py`. Do not try to run it yourself — it re-downloads several MB from yfinance. If the human specified a non-default universe (e.g. "sp500"), also verify the right cache is mounted — see **Universe selection** below.
+4. **Seed `results.tsv`** inside the worktree with just the header row (it should be absent in a brand-new worktree):
    ```
    commit	oos_sharpe	max_dd	turnover	status	description
    ```
@@ -39,9 +46,26 @@ Then:
 5. **Read context**: `README.md`, `prepare.py`, `strategy.py`. You've already read `program.md` (that's why you're here). Skim `log_result.py` and `running_best.py` only if you need to confirm an exit-code detail — don't re-derive the rules, they're in `program.md`.
 6. **Baseline run FIRST**: do not edit `strategy.py` yet. The very first run of the branch is the baseline commit-free run to seed `oos_results.tsv`. Follow the loop below with a trivial identity-commit path — see "First iteration" note at the bottom.
 
+### Universe selection
+
+The experiment loop defaults to `UNIVERSE_TAG=sp100_2024`. If the human names a different universe in the launch prompt (e.g. "on SP500", "with UNIVERSE_TAG=sp500_2024"):
+
+- Verify `universe_<tag>.json` exists at the repo root.
+- Verify `~/.cache/karpathy-quant-auto-research/prices.parquet` corresponds to that universe — `prepare.py` does NOT tag the cache file by universe, so the cache on disk might be the previous universe's prices. Check column count roughly matches the universe JSON (e.g. `uv run python -c "import pandas as pd; print(pd.read_parquet('...').shape)"`).
+- If the cache is for the wrong universe, stop and tell the human to either `cp ~/.cache/karpathy-quant-auto-research/prices.<tag>.parquet ~/.cache/karpathy-quant-auto-research/prices.parquet` (if they've preserved a tagged backup — see the multi-universe workflow memory) or `UNIVERSE_TAG=<tag> uv run prepare.py --refresh` to re-download. Do NOT re-download autonomously.
+- Export `UNIVERSE_TAG=<tag>` on EVERY call to `strategy.py`, `log_result.py`, `running_best.py`, etc. — they all read it at import time.
+
+### Parallel experiments
+
+Two or more worktrees can run concurrently when each has a unique timestamped tag. But:
+
+- **Parallel runs must share the same `UNIVERSE_TAG`.** The price cache is a single file (`~/.cache/karpathy-quant-auto-research/prices.parquet`); if two loops want different universes, they'll fight over it. Same-universe parallel runs just share the cache read-only, which is safe.
+- Each worktree has its own `results.tsv` / `oos_results.tsv` / `run.log`, so the grader and `running_best.py` see only that worktree's trials — they do NOT pool across parallel experiments. That's intentional: each run is a clean 20-trial branch.
+- Don't reach into a sibling worktree's files from inside your loop. If the human wants to compare across parallel branches, that's a morning-review job.
+
 ## Step 2 — The loop
 
-Repeat until the grader exits 4 or the human interrupts:
+Run every command from **inside the worktree** (`worktrees/<tag>/`). Repeat until the grader exits 4 or the human interrupts:
 
 ```bash
 # 1. Form a hypothesis (one line, economic intuition, not a knob-twist)
@@ -49,8 +73,10 @@ Repeat until the grader exits 4 or the human interrupts:
 git add strategy.py
 git commit -m "<short imperative summary of the change>"
 
-# 3. Backtest in strict-honesty mode — ALWAYS redirect, never tee/stream
+# 3. Backtest in strict-honesty mode — ALWAYS redirect, never tee/stream.
+#    Include UNIVERSE_TAG if non-default.
 SHOW_OOS=0 uv run strategy.py > run.log 2>&1
+# (or: SHOW_OOS=0 UNIVERSE_TAG=sp500_2024 uv run strategy.py > run.log 2>&1)
 
 # 4. Extract IS-only headline metrics (OOS lines will be masked <hidden, SHOW_OOS=0>)
 grep "^is_sharpe:\|^max_drawdown:\|^turnover_annual:\|^num_trades:\|^status_hint:" run.log
@@ -103,19 +129,88 @@ Momentum variants (3-1 / 6-1 / 12-1; risk-adjusted; residual) · short-horizon r
 
 ## Stop conditions (the only three)
 
-1. `log_result.py` returns exit 4 → trial cap reached. Print a one-screen summary: count of keep / discard / crash rows, best kept Sharpe from `running_best.py`, baseline from `running_best.py --baseline`, a list of the `thesis:` lines grouped by status. Exit the loop cleanly.
-2. Human interrupts (Ctrl-C or explicit "stop"). Leave the branch as-is; do not tidy up.
-3. You cannot articulate a defensible non-micro-variant hypothesis. Write a one-paragraph summary to chat (not to a file) and stop. Do NOT fabricate a filler trial.
+On a **graceful** stop (cases 1 and 3 below), run the **Archive + push + cleanup** sequence (next section) before returning to the human. On a human interrupt (case 2), do nothing — you can't clean up reliably mid-signal.
+
+1. `log_result.py` returns exit 4 → trial cap reached. Print a one-screen summary: the worktree path, branch name, `UNIVERSE_TAG`, count of keep / discard / crash rows, best kept Sharpe from `running_best.py`, baseline from `running_best.py --baseline`, `thesis:` lines grouped by status. Then run **Archive + push + cleanup**.
+2. Human interrupts (Ctrl-C or explicit "stop"). Leave the worktree and branch as-is; do not tidy up. The human has taken over.
+3. You cannot articulate a defensible non-micro-variant hypothesis. Write a one-paragraph summary to chat (not to a file) explaining what's been tried and why you're stopping. Then run **Archive + push + cleanup**. Do NOT fabricate a filler trial.
+
+## Archive + push + cleanup
+
+`results.tsv` and `oos_results.tsv` are gitignored, so removing the worktree destroys them. The archive step folds their content into a committed `SUMMARY.md` so the branch on origin is self-describing.
+
+```bash
+# (from inside worktrees/<tag>)
+
+# 1. Build SUMMARY.md — capture the full audit trail in a committed file.
+cat > SUMMARY.md <<EOF
+# quant-research/<tag>
+
+- **UNIVERSE_TAG**: <tag value, or "sp100_2024 (default)">
+- **Baseline (seed)**: $(uv run running_best.py --baseline --verbose 2>/dev/null || echo "n/a")
+- **Running best**:   $(uv run running_best.py --verbose 2>/dev/null || echo "no kept rows")
+- **Trials logged**:  $(uv run running_best.py --trials 2>/dev/null || echo "0")
+- **Stop reason**:    <trial-cap | no-defensible-hypothesis | …>
+
+## results.tsv
+
+\`\`\`
+$(cat results.tsv)
+\`\`\`
+
+## Theses by status
+
+### keep
+$(awk -F'\t' 'NR>1 && $5=="keep"  {print "- " $6}' results.tsv)
+
+### discard
+$(awk -F'\t' 'NR>1 && $5=="discard"{print "- " $6}' results.tsv)
+
+### crash
+$(awk -F'\t' 'NR>1 && $5=="crash"  {print "- " $6}' results.tsv)
+EOF
+
+# 2. Commit the summary.
+git add SUMMARY.md
+git commit -m "summary: quant-research/<tag> (<n-keep>/<n-trials>)"
+
+# 3. Push the branch — only if a remote exists. Do not force-push.
+if git remote get-url origin >/dev/null 2>&1; then
+  git push -u origin quant-research/<tag> || echo "push failed — leaving worktree in place for manual recovery"
+else
+  echo "no origin remote — skipping push, leaving worktree in place"
+fi
+
+# 4. Only remove the worktree if the push succeeded (or no remote was expected).
+#    If push failed, STOP and tell the human — do not silently lose the branch state.
+cd ../..    # back to repo root
+if git branch -r | grep -q "origin/quant-research/<tag>"; then
+  git worktree remove worktrees/<tag>
+  echo "archived and cleaned up: quant-research/<tag> pushed to origin"
+else
+  echo "worktree preserved at worktrees/<tag> — manual cleanup required"
+fi
+```
+
+Rules:
+- Never `--force` on push. If origin rejects (somehow the branch exists upstream), STOP and report — do not overwrite.
+- Never `git worktree remove --force` if the remote is missing the commits; that loses work.
+- Do NOT delete the branch locally (`git branch -D`). The worktree removal already detaches it; the branch stays referenceable. Deleting branches is the human's choice.
+- If there is no `origin` remote configured, skip push and preserve the worktree. Tell the human. Do NOT try to add a remote.
 
 ## Morning-review hint for the human (do NOT act on this during the loop)
 
-After the human wakes up, they will typically run:
+After the human wakes up and the cleanup has run, they review via the pushed branch:
 
 ```bash
-cat results.tsv
-grep '^keep' results.tsv
-# for each kept commit the human wants to sanity-check:
+git fetch origin
+git log origin/quant-research/<tag> --oneline        # trial commits + summary
+git show origin/quant-research/<tag>:SUMMARY.md      # the full archived summary
+
+# to sanity-check a specific kept commit:
 git checkout <commit> && uv run walkforward.py
 ```
 
-That walk-forward check is the human's job, not yours. You do not run `walkforward.py` inside the loop — it is a post-hoc OOS check.
+If the loop was Ctrl-C'd (stop condition 2), the worktree is still at `worktrees/<tag>/` and results.tsv / oos_results.tsv are intact there — review locally before deciding whether to archive.
+
+Walk-forward is the human's job, not yours. You do not run `walkforward.py` inside the loop — it is a post-hoc OOS check.

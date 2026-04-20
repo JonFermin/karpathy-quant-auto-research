@@ -24,3 +24,6 @@ oos_results.tsv
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Autoresearch worktrees (one per experiment branch; parallel-safe scratch)
+worktrees/
