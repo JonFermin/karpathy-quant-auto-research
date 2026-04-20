@@ -1,24 +1,36 @@
 # karpathy-quant-auto-research
 
-*One day, frontier quant research used to be done by meat traders staring at Bloomberg terminals between coffee and lunch, synchronizing once in a while in the ritual of "the morning meeting." That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents grinding through centuries of tick data overnight while everyone sleeps. The agents claim that we are now in the 4,311th generation of the strategy repo; in any case no one could tell if that's right or wrong as the "strategy" is now a self-modifying signal graph that has grown beyond human comprehension. This repo is the story of how it all began.*
+A direct port of Andrej Karpathy's [`karpathy/autoresearch`](https://github.com/karpathy/autoresearch) pattern — single agent-editable file, immutable harness, IS/OOS gate, git-native experiment trail — applied to daily US equity strategy search instead of LLM pretraining tweaks.
 
-The idea: give an AI agent a small but real vectorized backtesting harness on daily US equities and let it experiment autonomously overnight. It modifies the signal generator, runs a backtest against a frozen IS/OOS split, checks if OOS Sharpe improved subject to hard constraints, keeps or discards, and repeats. You wake up in the morning to a log of ~100 experiments and (hopefully) a better strategy. This is a direct fork of the pattern established in [karpathy/autoresearch](https://github.com/karpathy/autoresearch) — swap LLM pretraining for quant strategy search. The agent edits one file. The human reviews in the morning.
+Karpathy's repo works because nanoGPT loss is a clean, low-noise objective: a 1% val-loss improvement is real and reproduces. **OOS Sharpe on a 5-year window is not that.** Porting the loop unchanged would produce a beautiful audit trail of an agent successfully p-hacking itself into a corner. Most of the work in this repo is the machinery to keep that from happening — and an honest accounting of where it still does.
 
-**This is research, not a product.** There is no live deployment, no broker connection, no paper-trading link. The deliverable is a git-native audit trail of experiments for a human to review.
+If the original is "let an agent iterate on a clean signal," this fork is "let an agent iterate on a signal so noisy that the loop itself is the main hazard."
+
+## The premise, and why it's dangerous
+
+The setup is straightforward: an AI agent edits one file (`strategy.py`), runs a backtest against a frozen IS/OOS split, checks if OOS Sharpe improved subject to hard constraints, keeps or discards, repeats. You wake up to ~100 logged experiments and a current-best branch.
+
+The danger is also straightforward and worth stating up front:
+
+**A loop that runs hundreds of trials against a fixed out-of-sample slice is a multiple-testing engine.** With OOS Sharpe noise of roughly ±0.5 (90% CI) on this 5-year window, the expected best-of-200 looks impressive even if every underlying strategy is pure coin-flipping. If you take the headline number from a green row at face value, the agent has fooled you. The interesting question this repo tries to answer is not "can an agent find alpha" — it's "can the loop be instrumented to make most of its own false positives visible?"
+
+Spoiler: **partially**. There is no clever trick that makes a fixed-OOS search statistically clean. The repo trades in honest mitigations and an explicit list of where leakage remains.
+
+This is research process, not a product. There is no live deployment, no broker connection, no paper-trading link.
 
 ## How it works
 
-The repo is deliberately kept small and only really has three files that matter:
+Three files matter:
 
 - **`prepare.py`** — fixed constants, one-time data prep (downloads adjusted closes via yfinance), and the backtest engine (`run_backtest`, `print_summary`, `TimeBudget`). The T+1 execution shift lives inside `run_backtest` so the agent cannot accidentally introduce look-ahead. **Not modified.**
-- **`strategy.py`** — the single file the agent edits. Contains `generate_weights(prices) → weights` and a driver that calls `run_backtest` and prints the output block. Everything inside `generate_weights` is fair game: new signals, sizing, regime filters, rebalancing cadence, neutralization, etc.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human.**
+- **`strategy.py`** — the single file the agent edits. Contains `generate_weights(prices) → weights` and a driver that calls `run_backtest`. Everything inside `generate_weights` is fair game: signals, sizing, regime filters, rebalancing cadence, neutralization.
+- **`program.md`** — agent instructions. Edited and iterated on by the human between runs.
 
-The metric is **`oos_sharpe`** (out-of-sample annualized Sharpe on the 2020–2024 slice) subject to hard constraints: `max_drawdown ≤ 0.35` and `turnover_annual ≤ 50.0`. Higher Sharpe is better. Constraint-violating runs are force-discarded regardless of Sharpe.
+The metric is **`oos_sharpe`** on the 2020–2024 slice, subject to `max_drawdown ≤ 0.35` and `turnover_annual ≤ 50.0`. Constraint violations are force-discarded regardless of headline Sharpe.
 
 ## The baseline
 
-`strategy.py` ships with **12-1 cross-sectional momentum**, the hurdle every experiment has to clear. The code is five lines of real logic:
+`strategy.py` ships with **12-1 cross-sectional momentum**, the hurdle every experiment has to clear. Five lines of real logic:
 
 ```python
 mom = prices.pct_change(252).shift(21)      # 12-month return, skip last month
@@ -28,64 +40,78 @@ w = w.div(w.sum(axis=1).replace(0, 1), axis=0)  # equal-weight, gross = 1
 w = w.resample("ME").last().reindex(prices.index, method="ffill").fillna(0.0)  # hold monthly
 ```
 
-In plain English: **every month, buy the 10 S&P 100 names that went up the most over the last 12 months — ignoring the most recent month — and hold them for a month.** On this harness it lands at OOS Sharpe ≈ 0.92, max drawdown ≈ 0.32, turnover ~6/yr.
+Plain English: **every month, buy the 10 S&P 100 names that went up the most over the last 12 months — ignoring the most recent month — and hold them.** On this harness it lands at OOS Sharpe ≈ 0.92, max drawdown ≈ 0.32, turnover ~6/yr.
 
-### Why 12-1 momentum is the baseline
+### Why this is the baseline
 
-It's probably the single most-studied anomaly in equities. Jegadeesh & Titman (1993) documented it in US stocks. Asness, Moskowitz & Pedersen (*Value and Momentum Everywhere*, 2013) found the same pattern in 8 asset classes across 40 countries. Fama & French (2012) added it as the fourth factor in their model. It has survived out-of-sample since publication — roughly 30 years of post-discovery live performance — which is rare for a quant signal.
+12-1 momentum is probably the single most-studied anomaly in equities. Jegadeesh & Titman (1993) documented it in US stocks. Asness, Moskowitz & Pedersen (2013) found it in 8 asset classes across 40 countries. Fama & French (2012) added it as a fourth factor. It has survived ~30 years of post-publication live performance, which is rare for a quant signal. Two competing explanations: behavioral underreaction (information diffuses slowly) and risk premium (it crashes hard — ~73% drawdown for US long-short in 2009 — and investors demand compensation).
 
-Two broad families of explanation:
+Skipping the last month matters because short-horizon returns (1 day to 1 month) show the **opposite** effect — recent winners pull back, recent losers bounce (Lehmann 1990, Jegadeesh 1990). The "12-1" convention separates the two.
 
-- **Behavioral**: investors underreact to news and then gradually chase the trend. Information diffuses slowly across analysts, institutions, and retail, so yesterday's winners keep winning for several months before the crowd fully catches up.
-- **Risk-based**: momentum is compensation for crash risk. The strategy periodically blows up (2009, 2020) — most famously a ~73% drawdown in 2009 for a US long-short version — and investors demand a premium for holding something with that tail.
+### Why it's hard to beat here
 
-### Why *skip the last month*
+- **It's the right answer for this universe.** Momentum is a real, persistent effect. Most "improvements" an agent invents are either fitting IS noise or rediscovering a component of the same signal under a different name.
+- **SP100 is a narrow, rigged universe.** 100 survivorship-selected large-caps frozen at 2024: anything you bought in 2010 made it to 2024. The baseline already eats the survivorship premium for free.
+- **The harness is honest about noise.** Bootstrap CIs on OOS Sharpe are wide. A 0.03–0.10 "improvement" lives inside the band. The keep rule kills most of it.
 
-Short-horizon returns (1 day to 1 month) show the **opposite** effect: recent winners tend to pull back and recent losers bounce. Lehmann (1990) and Jegadeesh (1990) documented this short-term reversal. Including the most recent month in a momentum signal contaminates it with reversal and weakens the result. The "12-1" (twelve-month lookback, skip one) convention splits the two effects cleanly.
+The baseline is not a strawman. Beating it with a genuinely new idea is the point of the loop. Most of the time, the correct finding is that you didn't.
 
-### What makes it hard to beat here
+## P-hacking: prevention and remaining leaks
 
-- **It's the right answer.** Momentum is a real, persistent effect. Most "improvements" a researcher invents are either (a) fitting IS noise or (b) rediscovering an already-present component of the same signal.
-- **SP100 is a narrow, rigged universe.** 100 survivorship-selected large-caps frozen at 2024 means anything you bought in 2010 made it to 2024 — the baseline eats the survivorship premium for free. Adding filters mostly throws away names that also would have survived.
-- **The harness is honest about noise.** The 90% bootstrap CI on OOS Sharpe is wide (often ±0.5). A 0.03–0.10 "improvement" lives inside that band. The keep rule forces the lower CI bound to clear `running_best - 0.1`, which kills most noise wins.
+This is the section that drove the rewrite. Read it before getting excited about any number this repo prints.
 
-A useful frame: the baseline is not a weak strawman. It's a 30-year-old effect, carefully implemented, running on a universe that flatters it. Beating it with a genuinely new idea is the point of the loop; **most of the time, the correct finding is that you didn't**.
+### What the harness does to push back
+
+- **Strict-honesty mode (`SHOW_OOS=0`).** During the loop, every OOS-derived line in `run.log` is masked. The agent sees `is_sharpe`, hard-constraint flags, and a `status_hint` derived from IS — it does **not** see `oos_sharpe`, the per-year decomposition, or the bootstrap CI. The full OOS audit trail goes to a side-channel `oos_results.tsv` only the human reads. The agent literally cannot gradient-descend on OOS, because it cannot observe it.
+- **Bootstrap CI with a tightened keep rule.** Each run reports a stationary block bootstrap (200 resamples, 20-day blocks). Keep requires `ci_lo > running_best - 0.1`, not just `oos_sharpe > running_best`. A 0.03 "win" inside the noise band is rejected.
+- **Per-year OOS decomposition.** Every run emits `oos_sharpe_2020..2024`. A strategy scoring 1.4 by riding 2020 vol and being mediocre 2021–2024 is visible at a glance.
+- **Walk-forward (`walkforward.py`).** Five non-overlapping 2-year folds, 2014–2023. Strategies that look great on the headline OOS but inconsistent across folds get caught here in morning review.
+- **Deflated Sharpe in `analysis.ipynb`.** Bailey & López de Prado's deflated Sharpe explicitly adjusts for the number of trials and the variance of trial Sharpes. It's the right statistic for "is this best-of-N actually significant," and it's the one to consult before getting excited about a green row.
+- **Hard constraints up front.** Max-DD ≤ 0.35 and turnover ≤ 50/yr eliminate the worst classes of degenerate fits before they enter the keep pool.
+- **Single-file scope + git audit trail.** Every trial is a commit; `results.tsv` logs the description. Reviewing the *full* set of attempts (not just survivors) is the protection against survivorship bias inside the experiment log itself.
+
+### Where it still leaks
+
+- **The OOS slice is fixed and reused.** Strict-honesty stops the agent, but the *human* sees OOS between sessions, edits `program.md` based on what's working, and reruns. That is a slow but real OOS-contamination loop with no cryptographic fix short of escrowing a slice neither agent nor human ever inspects.
+- **Strict-honesty is honor-system.** A clever-enough agent could in principle infer OOS performance from IS/OOS divergence patterns or from `status_hint`. Mitigation is "the agent isn't trying to" — not a security property.
+- **Keep rule still uses `running_best`.** Bootstrap-CI tightening reduces but does not eliminate multiple-testing inflation. Deflated Sharpe is reported in the notebook but **not enforced by the keep gate**. A passing run has not passed deflated Sharpe.
+- **Survivorship bias compounds with multiple testing.** SP100/SP500 are frozen 2024 snapshots. Strategies that implicitly bet on "winners keep winning" inherit a free tailwind, and the agent gets ~200 chances to find one.
+- **Universe, costs, and data are all best-case.** yfinance adjusted closes (no microstructure, no failed fills, vendor-specific corporate actions), 5bps flat per side, 200bps borrow, no impact, no bid/ask, no capacity. Strategies that need tighter spreads or bigger size silently look better than they are.
+- **One regime.** 2010–2024 is one bull market with two interruptions (2018Q4, 2020). Walk-forward across 2-year folds helps, but the whole dataset shares a low-rate, high-multiple, US-large-cap-dominant macro backdrop.
+- **Cherry-picked branches.** Each `/autoresearch` invocation makes a fresh branch and pushes it. Running the loop ten times and only keeping the best-looking branch is another selection layer on top of the in-loop selection. Mitigation: read *all* the pushed branches in `analysis.ipynb`, not just the winner.
+
+### What "passing" actually means
+
+A `keep` row in `results.tsv` means: this strategy beat the running best on a single fixed OOS window, with a bootstrap-CI lower bound above `running_best - 0.1`, satisfying the hard constraints. **It does not mean the strategy has alpha.** It means it survived one bar in one specific synthetic environment. Honest interpretation of a green row is "worth a closer look in the morning notebook," not "deploy this."
 
 ## Quick start
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), internet access for the one-time yfinance download.
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), internet for the one-time yfinance download.
 
 ```bash
-# 1. Install uv (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
-uv sync
-
-# 3. Download and cache prices (one-time, ~1–2 min)
-uv run prepare.py
-
-# 4. Manually run the baseline backtest (~a few seconds)
-uv run strategy.py
+curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv
+uv sync                                            # install deps
+uv run prepare.py                                  # download + cache prices (~1–2 min)
+uv run strategy.py                                 # run the baseline backtest
 ```
 
-If the above all work, your setup is good and you can go into autonomous research mode.
+If those work, your setup is good and you can go into autonomous research mode.
 
 ## Running the agent
 
-Spin up Claude Code (or Codex, or whatever) in this repo. The repo ships with a **`quant-autoresearch` skill** (`.claude/skills/quant-autoresearch/SKILL.md`) that wraps `program.md` with timestamped git worktrees, strict-honesty `SHOW_OOS=0` mode, and an auto-push + cleanup on graceful exit. There's also a thin slash-command wrapper at `.claude/commands/autoresearch.md` so the skill is reachable from the slash menu.
+Spin up Claude Code (or Codex, or whatever) in this repo. The repo ships with a **`quant-autoresearch` skill** (`.claude/skills/quant-autoresearch/SKILL.md`) that wraps `program.md` with timestamped git worktrees, strict-honesty `SHOW_OOS=0` mode, and an auto-push + cleanup on graceful exit. There's also a slash-command wrapper at `.claude/commands/autoresearch.md`.
 
 ### Kick-off examples
 
 | Command | What happens |
 |---|---|
-| `/autoresearch` | Default SP100 universe. Creates `worktrees/<apr19-223742>`, runs baseline + up to 20 trials, pushes branch + `SUMMARY.md` to `origin`, removes the worktree. |
-| `/autoresearch sp500` | Same workflow, on the `sp500_2024` universe (503 tickers). Requires `universe_sp500_2024.json` to be checked in and the prices parquet to match — see "Switching universes" below. |
+| `/autoresearch` | Default SP100. Creates `worktrees/<apr19-223742>`, runs baseline + up to 20 trials, pushes branch + `SUMMARY.md` to `origin`, removes the worktree. |
+| `/autoresearch sp500` | Same workflow, on the `sp500_2024` universe (503 tickers). Requires `universe_sp500_2024.json` and the matching prices parquet. |
 | `/autoresearch sp100` | Explicit SP100 (equivalent to bare `/autoresearch`). |
 
-### Natural-language triggers (no slash required)
+### Natural-language triggers
 
-The skill also auto-fires when your prompt matches its description. Any of these work:
+The skill auto-fires when your prompt matches its description:
 
 ```
 kick off a new experiment
@@ -98,27 +124,20 @@ If you name a universe in the prompt, the skill picks it up and passes `UNIVERSE
 
 ### Parallel runs
 
-Each kick-off gets its own timestamped worktree (`worktrees/<month><day>-<HHMMSS>`), so two `/autoresearch` invocations in separate Claude Code sessions run concurrently without stepping on each other's `results.tsv` / `oos_results.tsv` / branches.
-
-Parallel runs on **different** universes are safe too: `prepare.py` namespaces the cache by `UNIVERSE_TAG` (`prices_sp100_2024.parquet`, `prices_sp500_2024.parquet`, …), so two loops on different universes read from separate files without contention. Same-universe parallel runs just share the cache read-only.
+Each kick-off gets its own timestamped worktree, so two `/autoresearch` invocations in separate sessions run concurrently without stepping on each other's `results.tsv` / `oos_results.tsv` / branches. Different universes are also safe: `prepare.py` namespaces the cache by `UNIVERSE_TAG` (`prices_sp100_2024.parquet`, `prices_sp500_2024.parquet`, …). Same-universe parallel runs share the cache read-only.
 
 ### Switching universes
 
-Each universe has its own parquet cache, keyed by `UNIVERSE_TAG`. First run per universe downloads; subsequent runs hit cache.
-
 ```bash
-# populate the cache for a universe (one-time per universe)
-UNIVERSE_TAG=sp500_2024 uv run prepare.py
-
-# then launch the loop — the skill reads UNIVERSE_TAG from the prompt
-UNIVERSE_TAG=sp500_2024 /autoresearch
+UNIVERSE_TAG=sp500_2024 uv run prepare.py     # one-time per universe
+UNIVERSE_TAG=sp500_2024 /autoresearch         # then launch
 ```
 
 Add a new universe by dropping `universe_<tag>.json` at the repo root with a list of tickers, then `UNIVERSE_TAG=<tag> uv run prepare.py`.
 
 ### What the agent does
 
-The `program.md` file is the authoritative agent spec; the skill is a thin operational wrapper around it. The short version: each loop iteration edits `strategy.py`, commits, runs `SHOW_OOS=0 uv run strategy.py`, logs the trial via `log_result.py` (the grader), and advances or resets based on the grader's exit code. Capped at 20 trials per branch. On graceful exit the worktree is archived via `SUMMARY.md` + `git push`, then removed.
+`program.md` is the authoritative agent spec; the skill is a thin operational wrapper. Each iteration: edit `strategy.py`, commit, run `SHOW_OOS=0 uv run strategy.py`, log the trial via `log_result.py`, advance or reset based on the grader's exit code. Capped at 20 trials per branch. On graceful exit the worktree is archived via `SUMMARY.md` + `git push`, then removed.
 
 ## Project structure
 
@@ -128,7 +147,7 @@ strategy.py                             — signal + weights (agent modifies thi
 program.md                              — agent instructions
 universe_sp100_2024.json                — frozen SP100 ticker list (default universe)
 universe_sp500_2024.json                — frozen SP500 ticker list (503 tickers)
-analysis.ipynb                          — notebook for reviewing results.tsv
+analysis.ipynb                          — notebook for reviewing results.tsv (deflated Sharpe lives here)
 running_best.py                         — CLI: current best kept oos_sharpe
 log_result.py                           — CLI: append a row to results.tsv from run.log
 walkforward.py                          — CLI: per-fold Sharpe sanity check for a strategy
@@ -139,26 +158,21 @@ pyproject.toml                          — dependencies
 worktrees/                              — per-experiment git worktrees (gitignored)
 ```
 
-## Design choices
+## Other limitations
 
-- **Single file to modify.** The agent only touches `strategy.py`. This keeps scope manageable and diffs reviewable.
-- **T+1 shift enforced in the harness.** The weights your strategy produces using data up to day `t` only take effect at the close of day `t+1`. This is done inside `run_backtest` — the strategy cannot bypass it without editing `prepare.py`, which is forbidden.
-- **Single IS/OOS split, not walk-forward.** 2010–2019 is IS, 2020–2024 is OOS. The research loop uses this single split so the agent can run hundreds of experiments cheaply; `walkforward.py` (5 non-overlapping 2-year folds, 2014–2023) and deflated Sharpe in `analysis.ipynb` are morning-review analyses layered on top of kept rows.
-- **Trust-based IS/OOS honesty with an optional strict mode.** `run_backtest` reports both splits on every run; set `SHOW_OOS=0` in the environment and OOS-derived lines are masked in `run.log`, with the full audit trail written to a side-channel `oos_results.tsv` the reviewer consults. The agent forms hypotheses on `is_sharpe` and uses `status_hint` + `running_best.py` to gate keep/discard.
-- **Bootstrap CI on OOS Sharpe.** A stationary block bootstrap (200 resamples, 20-day blocks) is reported with every run. The keep rule tightens to `ci_lo > running_best - 0.1` so a 0.03 "improvement" that lives inside the noise band is not kept.
-- **Per-year OOS Sharpe decomposition.** Each run emits `oos_sharpe_2020..2024` so a single-year driver (e.g. a 2020 vol harvest) is visible instead of hidden inside the headline.
-- **Hard constraints are blunt.** Max-DD and turnover caps keep degenerate strategies (leveraged martingale, daily-rebalance parameter fits) out of the `keep` list. They don't guarantee the strategy is good — just that it isn't obviously broken.
+Beyond the multiple-testing problem above:
 
-## Caveats / disclaimers
+- **Survivorship bias.** The universe is a frozen 2024-dated SP100 snapshot. Any ticker delisted or renamed before 2024-12-31 is silently absent. `run_backtest` does force weights to 0 on tickers without price data yet (mitigating IPO-era leakage for META, ABBV, TSLA, etc.), but a proper point-in-time membership schedule is not yet supplied. Results are biased upward relative to a real PIT backtest, often substantially.
+- **Data fidelity.** yfinance, free, unaudited, adjusted closes. Corporate actions, dividends, splits all follow yfinance conventions. Gaps and errors are not corrected. Don't assume parity with a paid vendor.
+- **Cost model is crude.** 5bps per side + 200bps annual borrow on shorts. No market-impact, no bid/ask, no capacity, no financing curve, no shorting locate cost beyond the flat 200bps.
+- **No deployment.** No broker, no paper trading, no live signal. A good `oos_sharpe` here is a hypothesis that survived one synthetic backtest, not a trade-ready signal.
+- **The agent is not a quant.** It pattern-matches against textbook signals and combinations. It does not understand microstructure, institutional plumbing, or why a published anomaly might already be arbitraged away. Treat its "discoveries" as starting points for human investigation, not as conclusions.
 
-This repo is designed for **research process, not production alpha.** Known issues with the backtest:
+If you want to use any idea that comes out of this loop for real money, you owe it: a proper point-in-time universe, a real cost/impact/capacity study, an out-of-sample window the loop has *never* touched, and a paper-trading sandbox before any capital. This repo does none of those things and is not a substitute for any of them.
 
-- **Survivorship bias.** The universe is a frozen 2024-dated SP100 snapshot. Any ticker that was delisted or renamed before 2024-12-31 is silently absent; `run_backtest` does force weights to 0 on tickers that have no price data yet (mitigating IPO-era leakage for e.g. META, ABBV, TSLA), but a proper point-in-time membership schedule is not yet supplied. Results are biased upward relative to a real PIT backtest.
-- **Data fidelity.** Prices come from yfinance (free, unaudited, adjusted closes). Corporate-action handling, dividend handling, and split adjustments follow yfinance's conventions. Gaps and errors are not corrected.
-- **Cost model is crude.** 5bps per side + 200bps annual borrow on shorts. No market-impact model, no bid/ask, no capacity analysis.
-- **No deployment.** There is no broker integration, no paper trading, no live signal generation. A good `oos_sharpe` in this repo is *not* a trade-ready signal — it is a hypothesis that survived one specific backtest.
+## Credit
 
-If you want to use any idea that comes out of this loop for real money, you owe it a real point-in-time backtest, a real capacity/impact study, and a real live-trading sandbox. This repo does none of those things.
+This repo is a fork-of-pattern (not a fork-of-code) of Andrej Karpathy's [`karpathy/autoresearch`](https://github.com/karpathy/autoresearch). The loop structure, the single-file-edit constraint, the agent-as-experimenter framing, and the git-native audit trail are all his ideas. Everything that's specifically about defending against multiple-testing leakage in a noisy financial objective — strict-honesty mode, bootstrap CI gates, per-year decomposition, walk-forward, deflated Sharpe in review, and the candid leakage list above — is what this fork adds on top.
 
 ## License
 
