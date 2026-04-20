@@ -73,27 +73,71 @@ If the above all work, your setup is good and you can go into autonomous researc
 
 ## Running the agent
 
-Spin up Claude Code (or Codex, or whatever) in this repo and prompt something like:
+Spin up Claude Code (or Codex, or whatever) in this repo. The repo ships with a **`quant-autoresearch` skill** (`.claude/skills/quant-autoresearch/SKILL.md`) that wraps `program.md` with timestamped git worktrees, strict-honesty `SHOW_OOS=0` mode, and an auto-push + cleanup on graceful exit. There's also a thin slash-command wrapper at `.claude/commands/autoresearch.md` so the skill is reachable from the slash menu.
+
+### Kick-off examples
+
+| Command | What happens |
+|---|---|
+| `/autoresearch` | Default SP100 universe. Creates `worktrees/<apr19-223742>`, runs baseline + up to 20 trials, pushes branch + `SUMMARY.md` to `origin`, removes the worktree. |
+| `/autoresearch sp500` | Same workflow, on the `sp500_2024` universe (503 tickers). Requires `universe_sp500_2024.json` to be checked in and the prices parquet to match — see "Switching universes" below. |
+| `/autoresearch sp100` | Explicit SP100 (equivalent to bare `/autoresearch`). |
+
+### Natural-language triggers (no slash required)
+
+The skill also auto-fires when your prompt matches its description. Any of these work:
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+kick off a new experiment
+start the autoresearch loop
+launch strict-honesty mode on sp500
+run program.md overnight on the sp100 universe
 ```
 
-The `program.md` file is essentially a super lightweight "skill."
+If you name a universe in the prompt, the skill picks it up and passes `UNIVERSE_TAG=<tag>` through to every harness call.
+
+### Parallel runs
+
+Each kick-off gets its own timestamped worktree (`worktrees/<month><day>-<HHMMSS>`), so two `/autoresearch` invocations in separate Claude Code sessions run concurrently without stepping on each other's `results.tsv` / `oos_results.tsv` / branches.
+
+**The one constraint:** parallel runs must share the same `UNIVERSE_TAG`. The price cache is a single file (`~/.cache/karpathy-quant-auto-research/prices.parquet`) and `prepare.py` does not namespace it by universe — so two concurrent loops on *different* universes would fight over the cache. Run those sequentially and swap the parquet in between (see next section).
+
+### Switching universes
+
+`prepare.py` caches prices at a single, universe-agnostic path. To run on a different universe (e.g. after using SP100), you need to either re-download or swap cache files:
+
+```bash
+# one-time, per universe: populate the cache with that universe's prices
+UNIVERSE_TAG=sp500_2024 uv run prepare.py --refresh
+
+# or — if you have tagged backups lying around:
+cp ~/.cache/karpathy-quant-auto-research/prices.sp500_2024.parquet \
+   ~/.cache/karpathy-quant-auto-research/prices.parquet
+```
+
+A simple convention that makes future swaps cheap: keep tagged backups after each download, e.g. `prices.sp100_2024.parquet`, `prices.sp500_2024.parquet`, and `cp` the right one onto `prices.parquet` before launching. The skill will verify the cache shape matches the requested universe's JSON before running.
+
+### What the agent does
+
+The `program.md` file is the authoritative agent spec; the skill is a thin operational wrapper around it. The short version: each loop iteration edits `strategy.py`, commits, runs `SHOW_OOS=0 uv run strategy.py`, logs the trial via `log_result.py` (the grader), and advances or resets based on the grader's exit code. Capped at 20 trials per branch. On graceful exit the worktree is archived via `SUMMARY.md` + `git push`, then removed.
 
 ## Project structure
 
 ```
-prepare.py                  — constants, data loader, backtest engine (do not modify)
-strategy.py                 — signal + weights (agent modifies this)
-program.md                  — agent instructions
-universe_sp100_2024.json    — frozen ticker list (checked in)
-analysis.ipynb              — notebook for reviewing results.tsv
-running_best.py             — CLI: current best kept oos_sharpe
-log_result.py               — CLI: append a row to results.tsv from run.log
-walkforward.py              — CLI: per-fold Sharpe sanity check for a strategy
-test_lookahead.py           — regression test for the T+1 shift
-pyproject.toml              — dependencies
+prepare.py                              — constants, data loader, backtest engine (do not modify)
+strategy.py                             — signal + weights (agent modifies this)
+program.md                              — agent instructions
+universe_sp100_2024.json                — frozen SP100 ticker list (default universe)
+universe_sp500_2024.json                — frozen SP500 ticker list (503 tickers)
+analysis.ipynb                          — notebook for reviewing results.tsv
+running_best.py                         — CLI: current best kept oos_sharpe
+log_result.py                           — CLI: append a row to results.tsv from run.log
+walkforward.py                          — CLI: per-fold Sharpe sanity check for a strategy
+test_lookahead.py                       — regression test for the T+1 shift
+pyproject.toml                          — dependencies
+.claude/skills/quant-autoresearch/      — Claude Code skill wrapping program.md
+.claude/commands/autoresearch.md        — slash-command alias for the skill
+worktrees/                              — per-experiment git worktrees (gitignored)
 ```
 
 ## Design choices
