@@ -30,12 +30,13 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
         T+1 execution — pre-shifting would double-delay your signal.
       - Row sums represent gross leverage; keep it ≤ 1 unless you know what you're doing.
     """
-    # Short-horizon reversal: 21d losers bounce from flow pressure / overreaction.
-    # Thesis: biotech event-driven selloffs overshoot; 1-month losers revert.
-    ret_21d = prices.pct_change(21)
+    # Medium-horizon reversal: 63d losers bounce from quarterly-overreaction.
+    # Thesis: biotech 3-month drawdowns on guidance/trial news overshoot as
+    # institutional holders de-risk; reversal takes longer but is less noisy.
+    ret_63d = prices.pct_change(63)
 
     # Bottom quintile (broader basket → lower turnover, smoother returns).
-    ranks = ret_21d.rank(axis=1, pct=True)
+    ranks = ret_63d.rank(axis=1, pct=True)
     mask = (ranks <= 0.2).astype(float)
 
     # Inverse-vol sizing within the basket — downweight names with ongoing
