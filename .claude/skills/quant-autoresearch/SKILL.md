@@ -109,8 +109,9 @@ echo "exit=$rc"
 #        discard → git reset --hard HEAD~1
 #    2 → description invalid. Fix the command and rerun log_result.py.
 #        Nothing was logged; do NOT reset.
-#    3 → no-op commit (AST-equal to HEAD~1). git reset --hard HEAD~1.
-#        Do not retry the same non-change.
+#    3 → AST-duplicate of a prior trial on this universe (any branch,
+#        via the shared trial cache). git reset --hard HEAD~1, pick a
+#        genuinely different hypothesis. Do not retry the same AST.
 #    4 → TRIAL CAP. Stop. Summarize results.tsv for morning review.
 #    5 → crash row written. git reset --hard HEAD~1. tail -n 50 run.log,
 #        learn, then try a different idea (or fix the bug if obvious).
@@ -242,7 +243,17 @@ cd ../..    # back to repo root
 # Exact-match check — `grep -q origin/$BRANCH` would prefix-match a sibling
 # branch (e.g. 0419-2237 vs 0419-223742) and nuke the wrong worktree.
 if git rev-parse --verify --quiet "refs/remotes/origin/$BRANCH" >/dev/null; then
-  git worktree remove "worktrees/$TAG"
+  # Try git's registered removal first (cleans .git/worktrees/ metadata),
+  # then always force-remove the filesystem directory — on Windows `git worktree
+  # remove` routinely fails with "Filename too long" / "Invalid argument" on the
+  # `.git/` subtree (MAX_PATH), leaving orphan files. Since origin has the
+  # branch, the files are disposable. Finally prune the registry so stale
+  # metadata doesn't accumulate. This block is unconditional on a successful
+  # push — do NOT leave disk cleanup as "optional for the human later".
+  git worktree remove "worktrees/$TAG" 2>/dev/null \
+    || echo "git worktree remove failed (likely Windows MAX_PATH on .git/) — forcing filesystem cleanup"
+  rm -rf "worktrees/$TAG"
+  git worktree prune
 
   # 5. Branch on outcome:
   #    - real improvement kept (non-seed keep) → open a PR so the human reviews
@@ -279,7 +290,7 @@ fi
 
 Rules:
 - Never `--force` on push. If origin rejects (somehow the branch exists upstream), STOP and report — do not overwrite.
-- Never `git worktree remove --force` if the remote is missing the commits; that loses work.
+- Never `git worktree remove --force` if the remote is missing the commits; that loses work. Likewise, the unconditional `rm -rf worktrees/$TAG` in step 4 is gated on the `origin/$BRANCH` check directly above it — do NOT move, delete, or skip that guard.
 - Delete the local branch (`git branch -D "$BRANCH"`) **only** on seed-only runs — the origin copy is the audit trail, the local copy is dead weight. On real-keep runs the local branch stays so the human can `git checkout` it without refetching.
 - Never force-push, never delete a branch on origin. Seed-only branches stay on origin as an audit trail of what didn't work.
 - If there is no `origin` remote configured, skip push and preserve the worktree. Tell the human. Do NOT try to add a remote.

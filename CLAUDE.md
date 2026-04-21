@@ -28,6 +28,8 @@ tail -n 50 run.log                    # inspect stack trace if grep is empty (cr
 
 Prices cache lives at `~/.cache/karpathy-quant-auto-research/prices_<UNIVERSE_TAG>.parquet` (outside the repo). Each universe gets its own cache file — set `UNIVERSE_TAG=sp500_2024` (or similar) to switch.
 
+A sibling **trial cache** lives at `~/.cache/karpathy-quant-auto-research/trial_cache_<UNIVERSE_TAG>.tsv`. `log_result.py` writes to it on every trial (AST hash + OOS Sharpe + status) and reads from it to (a) reject AST duplicates of any prior trial on this universe (exit 3) and (b) pool `sigma_n` / `N` for the deflation hurdle across all branches of the universe. Harness-side only — agents must not cat or grep it (it contains OOS-sensitive numbers). To retire a universe's accumulated exploration history, `rm` the file.
+
 ## Experiment loop (from program.md)
 
 1. Each run gets its own branch: `quant-research/<tag>` (e.g. `quant-research/mar5`).

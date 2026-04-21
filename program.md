@@ -98,7 +98,7 @@ uv run log_result.py "thesis: short one-line rationale for what I just tried"
 |------|-----------------------------------|------------|
 | 0    | row logged; status is on stdout   | Parse `status=keep\|discard` from the last stdout line. `keep` → advance. `discard` → `git reset --hard HEAD~1`. |
 | 2    | description invalid (missing `thesis:` prefix, or contains tab/newline) | Fix the command and rerun — nothing was logged. |
-| 3    | no code change in `strategy.py` since HEAD~1 (AST equality) | You committed a no-op (comment, whitespace, docstring only). `git reset --hard HEAD~1` and try a real change. Nothing was logged. |
+| 3    | AST duplicate of a prior trial on this universe (any branch, checked against the shared trial cache) | You committed an AST-identical version of a hypothesis already tried. `git reset --hard HEAD~1` and pick a genuinely different thesis. Nothing was logged. |
 | 4    | trial cap reached (default 20 per branch) | **Stop the loop.** Surface the branch's results.tsv for review. Do not raise the cap without a good reason — 20 is enough to select a real edge if one exists. |
 | 5    | crash row logged (no `oos_results.tsv` row for this commit — the run never reached `print_summary`) | `git reset --hard HEAD~1`. Inspect `run.log`. |
 
@@ -152,7 +152,7 @@ LOOP until the grader exits 4 (trial cap) or the human stops you:
 6. Log the run: `uv run log_result.py "thesis: <one-line rationale>"`. The grader computes the status; you don't.
 7. Branch on the grader's exit code:
    - **0** — stdout ends with `status=keep` (advance the branch) or `status=discard` (`git reset --hard HEAD~1`).
-   - **3** — no-op commit. `git reset --hard HEAD~1`. Don't retry the same change.
+   - **3** — AST-duplicate of a prior trial on this universe (any branch). `git reset --hard HEAD~1`, pick a genuinely different hypothesis.
    - **4** — trial cap. **Stop**. Summarize `results.tsv` for the human; the loop is done.
    - **5** — crash row written. `git reset --hard HEAD~1`. Look at `run.log` to learn from the failure before the next attempt.
 

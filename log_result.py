@@ -7,24 +7,34 @@ The agent runs:
 
 Everything else is computed by the harness from state on disk:
 
-  1. AST-compare strategy.py at HEAD vs HEAD~1 — comment/whitespace/
-     docstring-only commits are rejected as no-ops (exit 3).
+  1. Hash the stripped-AST of strategy.py at HEAD and look it up in the
+     per-universe shared cache at
+     ~/.cache/karpathy-quant-auto-research/trial_cache_<UNIVERSE_TAG>.tsv.
+     If any prior trial on any branch of this universe has the same AST
+     hash, reject (exit 3). Comment/whitespace/docstring-only changes
+     hash identically and are also rejected.
   2. Count existing rows in results.tsv against TRIAL_CAP (exit 4).
   3. Look up the current commit's OOS truth in oos_results.tsv. No row →
      the run never reached print_summary → crash (exit 5, crash row
      written).
   4. Apply the baseline-relative, deflation-aware, walk-forward-gated
-     keep rule; compute status; write the row; exit 0.
+     keep rule; compute status; write the row; append to the shared
+     cache; exit 0.
+
+The deflation term sigma_n and trial-count N are pooled from the shared
+cache — so the multiple-hypothesis hurdle grows with the universe's
+cumulative exploration budget, not just this branch's. Running a fresh
+branch does not reset the budget.
 
 The agent never chooses the status. Mis-grading is structurally impossible
 under this CLI — which is the point of the rewrite. `run.log` may mask
-OOS numbers under SHOW_OOS=0; oos_results.tsv is always complete and is
-the sole source of truth for grading.
+OOS numbers under SHOW_OOS=0; oos_results.tsv and the shared cache are
+both harness-side-only and are the sole sources of truth for grading.
 
 Exit codes:
   0 — row logged (status computed)
   2 — description invalid (tab/newline, or missing "thesis: " prefix on a non-crash row)
-  3 — no code change in strategy.py since HEAD~1
+  3 — AST duplicate of a prior trial on this universe (any branch)
   4 — trial cap reached — stop the loop and review
   5 — crash row logged (the run never reached print_summary)
 """
@@ -33,10 +43,15 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import math
 import os
+import platform
 import subprocess
 import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -44,8 +59,33 @@ import pandas as pd
 from prepare import OOS_RESULTS_TSV, REPO_ROOT
 from stats import expected_max_sharpe_null
 
+if platform.system() == "Windows":
+    import msvcrt
+else:
+    import fcntl
+
 RESULTS_TSV = REPO_ROOT / "results.tsv"
 HEADER = ["commit", "oos_sharpe", "max_dd", "turnover", "status", "description"]
+
+# Shared per-universe trial cache. Lives outside the repo and outside any
+# worktree so it survives worktree cleanup and is visible across concurrent
+# branches on the same UNIVERSE_TAG. Format: tab-separated, header on first
+# write. The cache is the single source of truth for (a) AST-duplicate
+# rejection and (b) the pooled sigma_n / N that feed the deflation hurdle.
+_CACHE_DIR = Path.home() / ".cache" / "karpathy-quant-auto-research"
+CACHE_HEADER = [
+    "ast_sha256",
+    "branch_tag",
+    "commit",
+    "oos_sharpe",
+    "status",
+    "hurdle_version",
+    "written_at",
+]
+# Bump if the hurdle-rule semantics change, so cohort-aware re-evaluation is
+# possible. Current rule: baseline + BASELINE_HURDLE_SHARPE + deflation, with
+# sigma/N pooled per-universe across the shared cache.
+HURDLE_VERSION = 1
 
 # How much better than baseline the point estimate must be before the
 # deflation term kicks in. Tunable by the reviewer; a smaller hurdle
@@ -89,7 +129,7 @@ def _git_show(ref: str, relpath: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# No-op detector (Phase 1b)
+# Shared-cache dedup + deflation (Phase 1b)
 # --------------------------------------------------------------------------- #
 
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
@@ -112,26 +152,159 @@ def _strip_docstrings(tree: ast.AST) -> ast.AST:
     return tree
 
 
-def _strategy_is_noop() -> bool | None:
-    """AST-compare strategy.py at HEAD vs HEAD~1.
+def _strategy_ast_hash() -> str | None:
+    """SHA-256 of the stripped-AST dump of strategy.py at HEAD.
 
-    Returns:
-      True  — semantically identical (comment/whitespace/docstring only)
-      False — genuine code change
-      None  — cannot compare (first commit on branch, git error, syntax error)
+    Returns None on git failure or syntax error; callers skip the dedup
+    check in that case and let the real failure surface elsewhere.
     """
-    head_src = _git_show("HEAD", "strategy.py")
-    prev_src = _git_show("HEAD~1", "strategy.py")
-    if head_src is None or prev_src is None:
+    src = _git_show("HEAD", "strategy.py")
+    if src is None:
         return None
     try:
-        head_tree = _strip_docstrings(ast.parse(head_src))
-        prev_tree = _strip_docstrings(ast.parse(prev_src))
+        tree = _strip_docstrings(ast.parse(src))
     except SyntaxError:
-        return None  # don't reject on syntax errors — the real failure surfaces elsewhere
-    a = ast.dump(head_tree, annotate_fields=False, include_attributes=False)
-    b = ast.dump(prev_tree, annotate_fields=False, include_attributes=False)
-    return a == b
+        return None
+    dump = ast.dump(tree, annotate_fields=False, include_attributes=False)
+    return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
+def _current_branch_tag() -> str:
+    """Return the portion of the branch name after 'quant-research/'.
+
+    Falls back to 'unknown' on detached HEAD or unexpected branch names.
+    Only used for audit / debug output in the cache; dedup is keyed on
+    AST hash, not on branch.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return "unknown"
+    branch = out.decode().strip()
+    prefix = "quant-research/"
+    return branch[len(prefix):] if branch.startswith(prefix) else (branch or "unknown")
+
+
+def _cache_path() -> Path:
+    """Resolve the per-universe cache path from UNIVERSE_TAG at call time.
+
+    Matches prepare.py's default of sp100_2024 when the env var is unset.
+    """
+    universe = os.environ.get("UNIVERSE_TAG", "sp100_2024")
+    return _CACHE_DIR / f"trial_cache_{universe}.tsv"
+
+
+@contextmanager
+def _cache_lock(path: Path, *, exclusive: bool):
+    """Cross-platform file lock context manager.
+
+    Yields an opened file handle. On POSIX uses fcntl.flock; on Windows
+    uses msvcrt.locking on a single byte range. msvcrt offers no shared
+    lock, so Windows readers serialize against writers too — fine given
+    append-only semantics and small file size.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a+" if exclusive else "r"
+    f = open(path, mode, encoding="utf-8", newline="")
+    try:
+        if platform.system() == "Windows":
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield f
+    finally:
+        try:
+            if platform.system() == "Windows":
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        finally:
+            f.close()
+
+
+def _read_cache() -> pd.DataFrame:
+    """Return the shared cache as a DataFrame, empty if the file is missing."""
+    path = _cache_path()
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=CACHE_HEADER)
+    try:
+        with _cache_lock(path, exclusive=False) as f:
+            f.seek(0)
+            df = pd.read_csv(f, sep="\t")
+    except (pd.errors.EmptyDataError, OSError):
+        return pd.DataFrame(columns=CACHE_HEADER)
+    except pd.errors.ParserError as e:
+        print(
+            f"WARNING: trial cache at {path} is malformed ({e}); "
+            f"dedup disabled for this run. Inspect manually.",
+            file=sys.stderr,
+        )
+        return pd.DataFrame(columns=CACHE_HEADER)
+    if "oos_sharpe" in df.columns:
+        df["oos_sharpe"] = pd.to_numeric(df["oos_sharpe"], errors="coerce")
+    for col in ("ast_sha256", "branch_tag", "commit", "status"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+    return df
+
+
+def _append_cache(
+    ast_hash: str,
+    branch_tag: str,
+    commit: str,
+    oos_sharpe: float,
+    status: str,
+) -> None:
+    """Append a row to the shared cache under an exclusive lock."""
+    path = _cache_path()
+    written_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    sharpe_str = (
+        f"{float(oos_sharpe):.6f}"
+        if oos_sharpe is not None and math.isfinite(float(oos_sharpe))
+        else "nan"
+    )
+    row = [
+        ast_hash,
+        branch_tag,
+        commit,
+        sharpe_str,
+        status,
+        str(HURDLE_VERSION),
+        written_at,
+    ]
+    with _cache_lock(path, exclusive=True) as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() == 0:
+            f.write("\t".join(CACHE_HEADER) + "\n")
+        f.write("\t".join(row) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _find_cache_duplicate(
+    cache_df: pd.DataFrame, ast_hash: str, current_commit: str
+) -> tuple[str, str] | None:
+    """Return (branch_tag, commit) of the earliest prior trial whose AST
+    hash matches, or None. Excludes rows for the current commit so a
+    re-invocation of log_result.py on the same commit doesn't self-hit.
+    """
+    if cache_df.empty or "ast_sha256" not in cache_df.columns:
+        return None
+    hits = cache_df[cache_df["ast_sha256"] == ast_hash]
+    if "commit" in hits.columns:
+        hits = hits[hits["commit"] != current_commit]
+    if hits.empty:
+        return None
+    row = hits.iloc[0]
+    return (str(row.get("branch_tag", "unknown")), str(row.get("commit", "")))
 
 
 # --------------------------------------------------------------------------- #
@@ -286,11 +459,22 @@ def main() -> int:
         )
         return 4
 
-    # Phase 1b — reject no-op commits.
-    noop = _strategy_is_noop()
-    if noop is True:
-        print("ERROR: no code change in strategy.py since HEAD~1", file=sys.stderr)
-        return 3
+    # Phase 1b — reject AST duplicates of any prior trial on this universe.
+    # The shared cache also feeds the deflation pool below, so read it once.
+    ast_hash = _strategy_ast_hash()
+    cache_df = _read_cache()
+    if ast_hash is not None:
+        dup = _find_cache_duplicate(cache_df, ast_hash, commit)
+        if dup is not None:
+            dup_branch, dup_commit = dup
+            universe = os.environ.get("UNIVERSE_TAG", "sp100_2024")
+            print(
+                f"ERROR: strategy.py AST matches prior trial {dup_commit} "
+                f"(branch quant-research/{dup_branch}, universe {universe}). "
+                f"Pick a genuinely different hypothesis.",
+                file=sys.stderr,
+            )
+            return 3
 
     # Phase 1 — fetch OOS truth for the current commit.
     oos_log = _read_oos_log()
@@ -300,6 +484,10 @@ def main() -> int:
         # The run never reached print_summary. Crash rows are allowed free-
         # form descriptions — people often paste the stack-trace gist there.
         _append_results_row(commit, float("nan"), float("nan"), float("nan"), "crash", desc)
+        if ast_hash is not None:
+            _append_cache(
+                ast_hash, _current_branch_tag(), commit, float("nan"), "crash"
+            )
         return 5
 
     if not desc.lower().startswith("thesis:"):
@@ -332,16 +520,20 @@ def main() -> int:
     else:
         base_oos, base_median_fold = baseline
 
-        # sigma_N across all non-crash oos_results.tsv rows on this branch.
+        # Pool sigma_n and N across ALL non-crash trials on this universe
+        # (any branch). The shared cache is the single source of truth; the
+        # multiple-hypothesis hurdle grows with the universe's cumulative
+        # exploration budget, not just this branch's.
         sigma_n = 0.0
-        if "oos_sharpe" in oos_log.columns:
-            pool = oos_log["oos_sharpe"].dropna().to_numpy()
+        n_for_sr0 = 2
+        if {"oos_sharpe", "status"}.issubset(cache_df.columns):
+            pool = cache_df.loc[
+                cache_df["status"] != "crash", "oos_sharpe"
+            ].dropna().to_numpy()
             pool = pool[np.isfinite(pool)]
             if pool.size >= 2:
                 sigma_n = float(pool.std(ddof=1))
-
-        # N: number of trials already on this branch (pre-this-row).
-        n_for_sr0 = max(int(n_existing), 2)
+            n_for_sr0 = max(int(pool.size), 2)
         sr0_raw = expected_max_sharpe_null(sigma_n, n_for_sr0) if sigma_n > 0 else 0.0
         sr0 = sr0_raw if (sr0_raw is not None and math.isfinite(sr0_raw)) else 0.0
         if sr0 < 0:
@@ -382,6 +574,10 @@ def main() -> int:
     # Report the grader's verdict to stderr so the agent sees why it lost.
     print(f"grader: {status} ({reason})", file=sys.stderr)
     _append_results_row(commit, oos_sharpe, max_dd, turnover, status, desc)
+    if ast_hash is not None:
+        _append_cache(
+            ast_hash, _current_branch_tag(), commit, oos_sharpe, status
+        )
     return 0
 
 
