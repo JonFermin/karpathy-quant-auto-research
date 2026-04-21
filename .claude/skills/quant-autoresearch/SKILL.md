@@ -174,15 +174,16 @@ On a **graceful** stop (cases 1 and 3 below), run the **Archive + push + cleanup
 
 ## Archive + push + cleanup
 
-`results.tsv` and `oos_results.tsv` are gitignored, so removing the worktree destroys them. The archive step folds their content into a committed `SUMMARY.md` so the branch on origin is self-describing.
+`results.tsv` and `oos_results.tsv` are gitignored, so removing the worktree destroys them. The archive step folds their content into a committed **per-run** summary at `summaries/<tag>.md` so the branch on origin is self-describing. The path is tag-scoped — never a shared `SUMMARY.md` at the root — so parallel branches can be merged or compared without file-level conflicts. Do NOT maintain a rollup/index file in the loop; the morning-review step regenerates that on demand from the per-run files (see the hint at the bottom).
 
 ```bash
 # (from inside worktrees/$TAG — $TAG exported back in Step 1)
 
-# 0. Compute everything that goes into SUMMARY.md / commit message up-front.
+# 0. Compute everything that goes into summaries/$TAG.md / commit message up-front.
 #    No `<placeholder>` literals should survive past this block — if you see
 #    `<...>` in the committed file, a substitution was missed.
 BRANCH="quant-research/$TAG"
+SUMMARY_PATH="summaries/$TAG.md"
 UNIV="${UNIVERSE_TAG:-sp100_2024 (default)}"
 BASELINE_LINE=$(uv run running_best.py --baseline --verbose 2>/dev/null || echo "n/a")
 RUNNING_LINE=$(uv run running_best.py --verbose 2>/dev/null || echo "no kept rows")
@@ -191,10 +192,12 @@ N_KEEP=$(awk -F'\t' 'NR>1 && $5=="keep" {n++} END {print n+0}' results.tsv)
 N_TRIAL=$(awk -F'\t' 'NR>1              {n++} END {print n+0}' results.tsv)
 STOP_REASON="trial-cap"   # set manually: "trial-cap" | "no-defensible-hypothesis"
 
-# 1. Build SUMMARY.md — capture the full audit trail in a committed file.
+# 1. Build summaries/$TAG.md — capture the full audit trail in a committed file.
+#    Per-run path (not SUMMARY.md) so parallel branches don't conflict on merge.
 #    Build in pieces (NOT a single unquoted heredoc): thesis strings in results.tsv
 #    are agent-authored and may contain `$(...)`, backticks, or `\` that would be
 #    re-evaluated by bash inside `<<EOF`. Here they pass through cat/awk only.
+mkdir -p summaries
 {
   printf '# %s\n\n' "$BRANCH"
   printf -- '- **UNIVERSE_TAG**: %s\n' "$UNIV"
@@ -213,17 +216,17 @@ STOP_REASON="trial-cap"   # set manually: "trial-cap" | "no-defensible-hypothesi
   awk -F'\t' 'NR>1 && $5=="discard" {print "- " $6}' results.tsv
   printf '\n### crash\n'
   awk -F'\t' 'NR>1 && $5=="crash"   {print "- " $6}' results.tsv
-} > SUMMARY.md
+} > "$SUMMARY_PATH"
 
 # Sanity-check: no unresolved <...> placeholders snuck through.
-if grep -q '<[a-z-]*>' SUMMARY.md; then
-  echo "ERROR: unresolved <placeholder> in SUMMARY.md — fix before committing"
-  grep -n '<[a-z-]*>' SUMMARY.md
+if grep -q '<[a-z-]*>' "$SUMMARY_PATH"; then
+  echo "ERROR: unresolved <placeholder> in $SUMMARY_PATH — fix before committing"
+  grep -n '<[a-z-]*>' "$SUMMARY_PATH"
   exit 1
 fi
 
 # 2. Commit the summary.
-git add SUMMARY.md
+git add "$SUMMARY_PATH"
 git commit -m "summary: $BRANCH ($N_KEEP/$N_TRIAL)"
 
 # 3. Push the branch — only if a remote exists. Do not force-push.
@@ -258,8 +261,16 @@ After the human wakes up and the cleanup has run, they review via the pushed bra
 
 ```bash
 git fetch origin
-git log origin/quant-research/<tag> --oneline        # trial commits + summary
-git show origin/quant-research/<tag>:SUMMARY.md      # the full archived summary
+git log origin/quant-research/<tag> --oneline                  # trial commits + summary
+git show origin/quant-research/<tag>:summaries/<tag>.md        # the full archived summary
+
+# Cross-run rollup: generate on demand from the per-run files (not committed).
+git for-each-ref --format='%(refname:short)' refs/remotes/origin/quant-research/ \
+  | while read ref; do
+      tag="${ref##*/}"
+      git show "$ref:summaries/$tag.md" 2>/dev/null | head -10
+      echo "---"
+    done
 
 # to sanity-check a specific kept commit:
 git checkout <commit> && uv run walkforward.py
