@@ -30,19 +30,20 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
         T+1 execution — pre-shifting would double-delay your signal.
       - Row sums represent gross leverage; keep it ≤ 1 unless you know what you're doing.
     """
-    # 12-1 momentum: 252d return, skip the last 21d to avoid the 1-month reversal.
-    mom = prices.pct_change(252).shift(21)
+    # Short-horizon reversal: 21d losers bounce from flow pressure / overreaction.
+    # Thesis: biotech event-driven selloffs overshoot; 1-month losers revert.
+    ret_21d = prices.pct_change(21)
 
-    # Top decile, equal-weighted.
-    ranks = mom.rank(axis=1, pct=True)
-    w = (ranks >= 1 - 0.1).astype(float)
+    # Bottom decile (buy losers), equal-weighted.
+    ranks = ret_21d.rank(axis=1, pct=True)
+    w = (ranks <= 0.1).astype(float)
 
     # Per-row normalize to gross 0.5 (reduced leverage for volatile universes).
     row_sum = w.sum(axis=1).replace(0, 1)
     w = w.div(row_sum, axis=0) * 0.5
 
-    # Month-end rebalance; hold through the month.
-    w = w.resample("ME").last().reindex(prices.index, method="ffill").fillna(0.0)
+    # Weekly rebalance (Fri close); reversal signals decay fast, so hold ~5d.
+    w = w.resample("W-FRI").last().reindex(prices.index, method="ffill").fillna(0.0)
     return w
 
 
