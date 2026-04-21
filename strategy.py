@@ -30,14 +30,22 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
         T+1 execution — pre-shifting would double-delay your signal.
       - Row sums represent gross leverage; keep it ≤ 1 unless you know what you're doing.
     """
-    # Composite reversal: average of 21d + 63d return ranks.
-    # Thesis: diversifying across horizons averages out idiosyncratic
-    # event noise at each scale; both ranks agreeing is a cleaner bottom.
-    r21 = prices.pct_change(21).rank(axis=1, pct=True)
-    r63 = prices.pct_change(63).rank(axis=1, pct=True)
-    combined = (r21 + r63) / 2
+    # Quad-composite reversal: average of 4 rank signals (21d raw, 63d raw,
+    # 21d vol-adjusted z-score, 63d vol-adjusted z-score). Thesis: combining
+    # raw and vol-normalized ranks across two horizons uses all independent
+    # information. Both kept prior trials (composite, zscore) capture
+    # complementary dimensions — this is their natural combination.
+    ret_21d = prices.pct_change(21)
+    ret_63d = prices.pct_change(63)
+    vol_63d = prices.pct_change().rolling(63).std().replace(0, float("nan"))
 
-    # Bottom decile of the composite rank — tighter basket, stronger signal.
+    r1 = ret_21d.rank(axis=1, pct=True)
+    r2 = ret_63d.rank(axis=1, pct=True)
+    r3 = (ret_21d / vol_63d).rank(axis=1, pct=True)
+    r4 = (ret_63d / vol_63d).rank(axis=1, pct=True)
+    combined = (r1 + r2 + r3 + r4) / 4
+
+    # Bottom decile of the 4-way composite.
     ranks = combined.rank(axis=1, pct=True)
     mask = (ranks <= 0.1).astype(float)
 
