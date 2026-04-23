@@ -40,29 +40,40 @@ Do NOT spawn the autoresearch subagents until every requested universe has a cac
 
 ## Step 2 — Assign unique tags
 
-The `quant-autoresearch` skill requires each run to have a unique numeric `MMDD-HHMMSS` tag, and two concurrent runs with the same tag will collide on the worktree path. Pre-assign tags with small second-offsets to guarantee uniqueness:
+The `quant-autoresearch` skill requires each run to have a unique numeric `MMDD-HHMMSS` tag, and two concurrent runs with the same tag will collide on the worktree path. Crucially, another Claude Code instance may be running this same skill simultaneously — so tags must be second-precision AND cross-checked against local branches, existing worktrees, AND origin refs before spawning.
+
+Build N tags by incrementing the current epoch one second at a time, then formatting with GNU `date -d @<epoch>`:
 
 ```bash
-BASE=$(date +%m%d-%H%M%S)              # e.g. 0421-070000
-# For the Nth universe in your list (N starting from 1), use:
-#   TAG_N = "$(date +%m%d-%H%M)" + printf '%02d' "$((original_seconds + N))"
-# In practice simplest: pick a round base like HHMM00, then append 01..NN:
-BASE_MINUTE=$(date +%m%d-%H%M)         # e.g. 0421-0700
-TAGS=("${BASE_MINUTE}01" "${BASE_MINUTE}02" "${BASE_MINUTE}03" "${BASE_MINUTE}04" "${BASE_MINUTE}05")
-```
-
-Verify none of the candidate branches already exist:
-
-```bash
-for TAG in "${TAGS[@]}"; do
-  if git branch --list "quant-research/$TAG" | grep -q .; then
-    echo "COLLISION on $TAG — increment minute base and retry"
-    exit 1
-  fi
+git fetch origin --prune                          # pull remote branches so collision check sees sister CC instances
+BASE_EPOCH=$(date +%s)
+N=5                                               # replace with actual number of universes requested
+TAGS=()
+for i in $(seq 0 $((N-1))); do
+  TAGS+=("$(date -d "@$((BASE_EPOCH + i))" +%m%d-%H%M%S)")
 done
+# e.g. TAGS=(0421-212759 0421-212800 0421-212801 0421-212802 0421-212803)
+# Minute/hour rollover is handled by date(1) — no manual carry logic needed.
 ```
 
-If any collision: increment the minute base (e.g. bump `HHMM+1`), regenerate tags, re-check. Do not drop the seconds suffix — the `quant-autoresearch` skill insists on full `MMDD-HHMMSS`.
+Verify every candidate is free across all three collision surfaces:
+
+```bash
+COLLIDED=()
+for TAG in "${TAGS[@]}"; do
+  if git branch --list "quant-research/$TAG" | grep -q .; then COLLIDED+=("$TAG(local)"); fi
+  if [ -d "worktrees/$TAG" ]; then COLLIDED+=("$TAG(worktree)"); fi
+  if git ls-remote --heads origin "quant-research/$TAG" | grep -q .; then COLLIDED+=("$TAG(origin)"); fi
+done
+if [ ${#COLLIDED[@]} -gt 0 ]; then
+  echo "COLLISION: ${COLLIDED[@]} — add 10s to BASE_EPOCH and retry"
+  exit 1
+fi
+```
+
+**If any collision:** bump `BASE_EPOCH=$((BASE_EPOCH + 10))`, regenerate TAGS, re-check. Typical cause is another CC instance launched within the same ~5-second window on the same universe set. 10-second bump clears it.
+
+Do not drop the seconds suffix — the `quant-autoresearch` skill insists on full `MMDD-HHMMSS`, and the seconds are what make cross-instance invocation safe.
 
 ## Step 3 — Spawn parallel subagents
 
@@ -113,7 +124,7 @@ If, after all subagents complete, any `worktrees/<tag>/` directory still exists:
 
 ## Common pitfalls
 
-- **Same-tag collisions**: if two subagents somehow get the same tag (e.g. spawned from distinct skill invocations), their `git worktree add` races. Pre-assigning tags from Step 2 prevents this.
+- **Same-tag collisions**: if two subagents somehow get the same tag (e.g. spawned from distinct skill invocations or from a sister CC instance running this same skill), their `git worktree add` races. Step 2's second-precision epoch-increment scheme plus the three-surface collision check (local branch, worktree dir, origin ref) prevents this — but only if you actually `git fetch origin` first so the origin check sees sister-instance branches.
 - **Downloading caches in parallel with running agents**: don't. A subagent that boots while its cache is still being written will see a partial parquet. Always finish all downloads before spawning.
 - **Passing the skill content instead of a path**: the `quant-autoresearch` skill is ~270 lines. Pasting it into every subagent prompt wastes tokens. Just hand them the absolute path and tell them to read it.
 - **Waiting synchronously**: do not sleep-poll for background agents. You are automatically notified when each completes — continue other work or respond to the user in the meantime.
