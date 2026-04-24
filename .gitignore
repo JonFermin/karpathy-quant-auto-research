@@ -19,8 +19,15 @@ dev/
 results.tsv
 run.log
 
-# Side-channel OOS audit log written by the harness (agent must NOT cat)
+# Side-channel OOS audit log written by the harness (agent must NOT cat).
+# `.old` variants are migration backups kept when the schema changes.
 oos_results.tsv
+oos_results.tsv.old*
+
+# Per-commit null-test and sensitivity-sweep audits (written by
+# null_test.py / sensitivity.py — belong outside git, same as results.tsv).
+null_results_*.json
+sensitivity_results_*.json
 
 # Jupyter
 .ipynb_checkpoints/

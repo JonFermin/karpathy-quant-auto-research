@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import io
 import math
 import os
 import platform
@@ -57,7 +58,7 @@ import numpy as np
 import pandas as pd
 
 from prepare import OOS_RESULTS_TSV, REPO_ROOT
-from stats import expected_max_sharpe_null
+from stats import expected_max_sharpe_null, jobson_korkie_memmel
 
 if platform.system() == "Windows":
     import msvcrt
@@ -83,9 +84,17 @@ CACHE_HEADER = [
     "written_at",
 ]
 # Bump if the hurdle-rule semantics change, so cohort-aware re-evaluation is
-# possible. Current rule: baseline + BASELINE_HURDLE_SHARPE + deflation, with
-# sigma/N pooled per-universe across the shared cache.
-HURDLE_VERSION = 1
+# possible. Current rule (v2): baseline + BASELINE_HURDLE_SHARPE + deflation,
+# with sigma/N pooled per-universe across the shared cache; ci_lo gate
+# replaced by Jobson-Korkie/Memmel one-sided paired Sharpe-difference test;
+# fold gate split into IS-only (hard) and OOS-only (soft); fold Sharpes are
+# computed with a 21d embargo; optional vol-scaled cost slope and
+# time-varying RF are read from prepare's env-configured constants.
+HURDLE_VERSION = 2
+
+# One-sided Jobson-Korkie/Memmel p-value threshold: the new strategy's
+# OOS Sharpe must beat the baseline's by a margin significant at this level.
+JK_MEMMEL_P_MAX = 0.05
 
 # How much better than baseline the point estimate must be before the
 # deflation term kicks in. Tunable by the reviewer; a smaller hurdle
@@ -238,7 +247,14 @@ def _read_cache() -> pd.DataFrame:
     try:
         with _cache_lock(path, exclusive=False) as f:
             f.seek(0)
-            df = pd.read_csv(f, sep="\t")
+            df = pd.read_csv(
+                f, sep="\t",
+                dtype={
+                    "ast_sha256": str, "branch_tag": str,
+                    "commit": str, "status": str,
+                    "hurdle_version": str, "written_at": str,
+                },
+            )
     except (pd.errors.EmptyDataError, OSError):
         return pd.DataFrame(columns=CACHE_HEADER)
     except pd.errors.ParserError as e:
@@ -315,11 +331,18 @@ def _read_results_tsv() -> pd.DataFrame:
     if not RESULTS_TSV.exists() or RESULTS_TSV.stat().st_size == 0:
         return pd.DataFrame(columns=HEADER)
     try:
-        df = pd.read_csv(RESULTS_TSV, sep="\t")
+        # Force commit column to string: 7-char hex commits like "6987e31"
+        # parse as 6.987e+34 under default type inference.
+        df = pd.read_csv(
+            RESULTS_TSV, sep="\t",
+            dtype={"commit": str, "status": str, "description": str},
+        )
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=HEADER)
     if "status" in df.columns:
         df["status"] = df["status"].astype(str).str.strip().str.lower()
+    if "commit" in df.columns:
+        df["commit"] = df["commit"].astype(str).str.strip()
     return df
 
 
@@ -327,7 +350,18 @@ def _read_oos_log() -> pd.DataFrame:
     if not OOS_RESULTS_TSV.exists() or OOS_RESULTS_TSV.stat().st_size == 0:
         return pd.DataFrame()
     try:
-        df = pd.read_csv(OOS_RESULTS_TSV, sep="\t")
+        # Force text columns to string: 7-char hex commits ("6987e31")
+        # otherwise parse as scientific notation and the grader can't
+        # match them against _short_commit(). Same for status_hint.
+        df = pd.read_csv(
+            OOS_RESULTS_TSV, sep="\t",
+            dtype={
+                "commit": str, "status_hint": str,
+                "yearly_sharpe_json": str, "fold_sharpes_json": str,
+                "is_fold_sharpes_json": str, "oos_fold_sharpes_json": str,
+                "oos_daily_returns_json": str,
+            },
+        )
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
     numeric_cols = [
@@ -393,13 +427,36 @@ def _latest_oos_row_for(commit: str, oos_log: pd.DataFrame) -> pd.Series | None:
     return matches.iloc[-1]
 
 
+def _parse_daily_returns(raw: object) -> pd.Series | None:
+    """Deserialize a `pd.Series.to_json(orient='split')` blob into a Series,
+    or return None if the blob is empty/invalid.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, float) and not math.isfinite(raw):
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "nan":
+        return None
+    try:
+        ser = pd.read_json(io.StringIO(s), orient="split", typ="series")
+    except (ValueError, TypeError):
+        return None
+    try:
+        ser.index = pd.to_datetime(ser.index)
+    except (ValueError, TypeError):
+        return None
+    return ser.astype(float)
+
+
 def _baseline_values(
     results: pd.DataFrame, oos_log: pd.DataFrame
-) -> tuple[float, float] | None:
-    """Return (baseline_oos_sharpe, baseline_median_fold_sharpe) drawn from
-    the first non-crash row in results.tsv, joined to oos_results.tsv for
-    the real numbers. Returns None when no baseline exists yet (this run
-    IS the baseline).
+) -> dict | None:
+    """Return a dict of baseline metrics drawn from the first non-crash row in
+    results.tsv, joined to oos_results.tsv. Keys:
+        oos_sharpe, median_fold_sharpe, is_fold_median_sharpe,
+        oos_fold_median_sharpe, daily_returns (pd.Series or None)
+    Returns None when no baseline exists yet (this run IS the baseline).
     """
     if results.empty or "status" not in results.columns:
         return None
@@ -408,24 +465,33 @@ def _baseline_values(
         return None
     seed_commit = str(non_crash.iloc[0].get("commit", "")).strip()
 
-    base_oos = float("nan")
-    base_median_fold = float("nan")
+    out: dict = {
+        "oos_sharpe": float("nan"),
+        "median_fold_sharpe": float("nan"),
+        "is_fold_median_sharpe": float("nan"),
+        "oos_fold_median_sharpe": float("nan"),
+        "daily_returns": None,
+    }
     if seed_commit and not oos_log.empty and "commit" in oos_log.columns:
         matches = oos_log[oos_log["commit"] == seed_commit]
         if not matches.empty:
             r = matches.iloc[-1]
-            if pd.notna(r.get("oos_sharpe")):
-                base_oos = float(r["oos_sharpe"])
-            if pd.notna(r.get("median_fold_sharpe")):
-                base_median_fold = float(r["median_fold_sharpe"])
+            for key in (
+                "oos_sharpe", "median_fold_sharpe",
+                "is_fold_median_sharpe", "oos_fold_median_sharpe",
+            ):
+                v = r.get(key)
+                if pd.notna(v):
+                    out[key] = float(v)
+            out["daily_returns"] = _parse_daily_returns(r.get("oos_daily_returns_json"))
     # Fallback to results.tsv's own number if the side-channel doesn't have it.
-    if not math.isfinite(base_oos):
+    if not math.isfinite(out["oos_sharpe"]):
         raw = non_crash.iloc[0].get("oos_sharpe")
         try:
-            base_oos = float(raw)
+            out["oos_sharpe"] = float(raw)
         except (TypeError, ValueError):
-            base_oos = float("nan")
-    return base_oos, base_median_fold
+            pass
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -502,6 +568,9 @@ def main() -> int:
     status_hint = str(oos_row.get("status_hint", "")).strip().lower()
     median_fold = float(oos_row.get("median_fold_sharpe", float("nan")))
     min_fold = float(oos_row.get("min_fold_sharpe", float("nan")))
+    is_fold_median = float(oos_row.get("is_fold_median_sharpe", float("nan")))
+    oos_fold_median = float(oos_row.get("oos_fold_median_sharpe", float("nan")))
+    current_returns = _parse_daily_returns(oos_row.get("oos_daily_returns_json"))
 
     # Harness-level crash (hard constraint violated / non-finite metrics) →
     # discard. The row is still worth logging because it informs the trial cap.
@@ -518,17 +587,24 @@ def main() -> int:
         status = "keep"
         reason = "seed row (no prior baseline)"
     else:
-        base_oos, base_median_fold = baseline
+        base_oos = baseline["oos_sharpe"]
+        base_is_fold_median = baseline["is_fold_median_sharpe"]
+        base_returns = baseline["daily_returns"]
 
         # Pool sigma_n and N across ALL non-crash trials on this universe
         # (any branch). The shared cache is the single source of truth; the
         # multiple-hypothesis hurdle grows with the universe's cumulative
-        # exploration budget, not just this branch's.
+        # exploration budget, not just this branch's. Restrict the pool to
+        # the current HURDLE_VERSION so a cost-model bump doesn't mix the
+        # old and new regimes in the deflation.
         sigma_n = 0.0
         n_for_sr0 = 2
-        if {"oos_sharpe", "status"}.issubset(cache_df.columns):
-            pool = cache_df.loc[
-                cache_df["status"] != "crash", "oos_sharpe"
+        if {"oos_sharpe", "status", "hurdle_version"}.issubset(cache_df.columns):
+            same_version = cache_df[
+                cache_df["hurdle_version"].astype(str) == str(HURDLE_VERSION)
+            ]
+            pool = same_version.loc[
+                same_version["status"] != "crash", "oos_sharpe"
             ].dropna().to_numpy()
             pool = pool[np.isfinite(pool)]
             if pool.size >= 2:
@@ -540,20 +616,37 @@ def main() -> int:
             sr0 = 0.0
 
         hurdle = base_oos + BASELINE_HURDLE_SHARPE + sr0
-        fold_hurdle = (
-            base_median_fold + MIN_FOLD_MEDIAN_DELTA
-            if math.isfinite(base_median_fold)
+        is_fold_hurdle = (
+            base_is_fold_median + MIN_FOLD_MEDIAN_DELTA
+            if math.isfinite(base_is_fold_median)
             else -math.inf
         )
+
+        # Jobson-Korkie/Memmel paired Sharpe-difference test. Needs the
+        # baseline's and current run's OOS daily returns. If either is
+        # missing (legacy rows predating the serialized-returns column),
+        # fall back to the old ci_lo > baseline rule so the gate still
+        # produces a verdict.
+        if current_returns is not None and base_returns is not None:
+            jk_z, jk_p = jobson_korkie_memmel(current_returns, base_returns)
+            jk_pass = math.isfinite(jk_p) and jk_p <= JK_MEMMEL_P_MAX
+            jk_label = f"JK-Memmel p {jk_p:.4f} <= {JK_MEMMEL_P_MAX:.2f} (z {jk_z:.3f})"
+        else:
+            jk_pass = math.isfinite(oos_lo) and oos_lo > base_oos
+            jk_label = (
+                f"ci_lo {oos_lo:.4f} > baseline {base_oos:.4f} "
+                "(fallback — missing OOS return series)"
+            )
 
         checks = {
             f"oos_sharpe {oos_sharpe:.4f} > hurdle {hurdle:.4f}"
             f" (= baseline {base_oos:.4f} + {BASELINE_HURDLE_SHARPE:.2f} + sr0 {sr0:.4f})":
                 oos_sharpe > hurdle,
-            f"oos_sharpe_ci_lo {oos_lo:.4f} > baseline {base_oos:.4f}":
-                math.isfinite(oos_lo) and oos_lo > base_oos,
-            f"median_fold_sharpe {median_fold:.4f} > fold_hurdle {fold_hurdle:.4f}":
-                math.isfinite(median_fold) and median_fold > fold_hurdle,
+            jk_label: jk_pass,
+            f"is_fold_median_sharpe {is_fold_median:.4f} > is_fold_hurdle {is_fold_hurdle:.4f}":
+                math.isfinite(is_fold_median) and is_fold_median > is_fold_hurdle,
+            f"oos_fold_median_sharpe {oos_fold_median:.4f} > 0":
+                math.isfinite(oos_fold_median) and oos_fold_median > 0,
             f"min_fold_sharpe {min_fold:.4f} > 0":
                 math.isfinite(min_fold) and min_fold > 0,
             f"max_drawdown {max_dd:.4f} <= {MAX_DD_HARD}":
@@ -572,7 +665,19 @@ def main() -> int:
             reason = "failed: " + "; ".join(failed)
 
     # Report the grader's verdict to stderr so the agent sees why it lost.
-    print(f"grader: {status} ({reason})", file=sys.stderr)
+    # Under SHOW_OOS=0, suppress the detailed gate-level reason: it leaks
+    # OOS numbers (fold medians, JK p-values, Sharpe deltas) through the
+    # per-gate strings. The agent sees only pass/fail; the reviewer reads
+    # the full reason in the oos_results.tsv audit trail.
+    show_oos = os.environ.get("SHOW_OOS", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if show_oos:
+        print(f"grader: {status} ({reason})", file=sys.stderr)
+    else:
+        generic = {
+            "keep": "cleared all gates",
+            "discard": "one or more gates failed",
+        }.get(status, "verdict")
+        print(f"grader: {status} ({generic})", file=sys.stderr)
     _append_results_row(commit, oos_sharpe, max_dd, turnover, status, desc)
     if ast_hash is not None:
         _append_cache(

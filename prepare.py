@@ -44,8 +44,34 @@ UNIVERSE_TAG = os.environ.get("UNIVERSE_TAG", "sp100_2024").strip() or "sp100_20
 BARS = "1d"
 
 COST_BPS = 5.0                   # per-side transaction cost, applied to |Δw|
-BORROW_BPS_ANNUAL = 200.0        # borrow cost on short exposure, pro-rated daily
-RISK_FREE_ANNUAL = 0.03
+
+# Optional per-name vol-scaled impact slope. When IMPACT_BPS_SLOPE > 0, cost
+# for each name is COST_BPS + IMPACT_BPS_SLOPE * vol_rank_pct, where
+# vol_rank_pct is the name's 63d realized-vol percentile that day. This
+# penalizes thin high-vol names the way a realistic execution cost would.
+# Defaults to 0 (no impact) for backwards compatibility with the original
+# harness. Set IMPACT_BPS_SLOPE=20 to emulate realistic biotech/small-cap.
+IMPACT_BPS_SLOPE = float(os.environ.get("IMPACT_BPS_SLOPE", "0"))
+
+# Per-universe borrow rate (bps per year on short exposure). Large caps are
+# easy to borrow; small caps and biotechs are not. Opt-in via env var so
+# existing cached Sharpes stay comparable; default is the flat 200bps.
+_BORROW_BPS_BY_UNIVERSE = {
+    "sp100_2024": 150.0,
+    "sp500_2024": 200.0,
+    "ndx100_2024": 150.0,
+    "sp400_2024": 250.0,
+    "sp600_2024": 400.0,
+    "xbi_2026":   600.0,
+}
+_USE_UNIVERSE_TIER_BORROW = os.environ.get("USE_UNIVERSE_TIER_BORROW", "0").strip().lower() not in {"0", "false", "no", "off", ""}
+BORROW_BPS_ANNUAL = (
+    _BORROW_BPS_BY_UNIVERSE.get(UNIVERSE_TAG, 200.0)
+    if _USE_UNIVERSE_TIER_BORROW else 200.0
+)
+
+RISK_FREE_ANNUAL = 0.03          # fallback when time-varying RF is disabled
+USE_TIME_VARYING_RF = os.environ.get("USE_TIME_VARYING_RF", "0").strip().lower() not in {"0", "false", "no", "off", ""}
 
 MIN_TRADES = 50                  # fewer than this → crash status
 MAX_DRAWDOWN_HARD = 0.35         # exceeded → force_discard
@@ -80,6 +106,30 @@ WALKFORWARD_FOLDS: list[tuple[str, str, str]] = [
     ("fold_2022_2023", "2022-01-01", "2023-12-31"),
 ]
 
+# Honest walk-forward split. IS_FOLDS live entirely inside the 2010-2019
+# training window — they are the only folds that test true out-of-sample
+# robustness without re-using the headline 2020-2024 OOS data. OOS_FOLDS
+# are sub-windows of the headline OOS, so they inform regime stability
+# but are NOT independent tests. The grader gates on IS_FOLDS median (hard)
+# and OOS_FOLDS median (soft) separately.
+IS_FOLDS: list[tuple[str, str, str]] = [
+    ("fold_2014_2015", "2014-01-01", "2015-12-31"),
+    ("fold_2016_2017", "2016-01-01", "2017-12-31"),
+    ("fold_2018_2019", "2018-01-01", "2019-12-31"),
+]
+OOS_FOLDS: list[tuple[str, str, str]] = [
+    ("fold_2020_2021", "2020-01-01", "2021-12-31"),
+    ("fold_2022_2023", "2022-01-01", "2023-12-31"),
+]
+
+# Days of embargo trimmed from the start of each fold before the fold's
+# Sharpe is computed. Absorbs lookback bleed-over — a strategy using a 63d
+# rolling window at fold_start would contaminate the first ~63 trading days
+# of the fold with pre-fold price information. 21 is a pragmatic compromise
+# that handles most short-horizon lookbacks; longer-horizon strategies (6-
+# 12 months) would want more.
+EMBARGO_DAYS = 21
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -88,6 +138,16 @@ REPO_ROOT = Path(__file__).resolve().parent
 CACHE_DIR = Path.home() / ".cache" / "karpathy-quant-auto-research"
 PRICES_PARQUET = CACHE_DIR / f"prices_{UNIVERSE_TAG}.parquet"
 UNIVERSE_JSON = REPO_ROOT / f"universe_{UNIVERSE_TAG}.json"
+# Optional PIT membership schedule. Schema:
+#   {"removals": [{"ticker": "XXX", "date": "YYYY-MM-DD"}, ...],
+#    "additions": [{"ticker": "YYY", "date": "YYYY-MM-DD"}, ...]}
+# Absence is a signal: current behavior is "ticker is active whenever it
+# has valid prices". Presence overlays explicit removals and lazy-additions
+# on top. Population is out-of-scope for this harness — the user is
+# expected to curate it from iShares/SPDR holdings history.
+UNIVERSE_MEMBERSHIP_JSON = REPO_ROOT / f"universe_membership_{UNIVERSE_TAG}.json"
+# Cached 13-week T-bill discount rate (^IRX) for time-varying risk-free.
+RF_PARQUET = CACHE_DIR / "rf_3m.parquet"
 
 # Side-channel OOS log. Every run appends the full result dict here so the
 # reviewer has an audit trail even when SHOW_OOS is off. The agent is
@@ -158,13 +218,38 @@ def universe_asof(date: pd.Timestamp | str, prices: pd.DataFrame | None = None) 
     return active
 
 
+def _load_membership_schedule() -> dict | None:
+    """Load the optional PIT membership schedule for UNIVERSE_TAG.
+
+    Returns None when the file is absent or malformed (caller falls back
+    to the first-valid-index heuristic). A well-formed schedule is a dict
+    with keys 'removals' and/or 'additions', each a list of
+    {ticker, date} records.
+    """
+    if not UNIVERSE_MEMBERSHIP_JSON.exists():
+        return None
+    try:
+        with open(UNIVERSE_MEMBERSHIP_JSON) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def membership_mask(prices: pd.DataFrame) -> pd.DataFrame:
     """(date × ticker) boolean mask: True where the ticker is active.
 
-    Built from `universe_asof` — today equivalent to "has a valid price
-    at or before this date". `run_backtest` uses this to force inactive
-    weights to 0 so the agent cannot inadvertently long a not-yet-listed
-    ticker with the residual allocation surviving through ffill.
+    Baseline rule: a ticker is active on dates on or after its
+    first-valid-price date. If a PIT membership schedule exists for this
+    universe, it overlays:
+      - `additions`: each ticker becomes active only on/after its added date
+        (later of first-valid-price and schedule's added date).
+      - `removals`: each ticker becomes inactive strictly after its
+        removed date, no matter how much price data exists beyond that.
+    `run_backtest` uses this to force inactive weights to 0 so the agent
+    cannot inadvertently long a not-yet-listed or already-delisted ticker.
     """
     cols = list(prices.columns)
     # first_valid_index per ticker: the first date we have a price for it.
@@ -175,6 +260,33 @@ def membership_mask(prices: pd.DataFrame) -> pd.DataFrame:
             mask[c] = False
         else:
             mask.loc[mask.index < fv, c] = False
+
+    schedule = _load_membership_schedule()
+    if schedule is None:
+        return mask
+
+    for rec in schedule.get("additions") or []:
+        ticker = str(rec.get("ticker", "")).strip()
+        added = rec.get("date")
+        if ticker not in mask.columns or added is None:
+            continue
+        try:
+            added_ts = pd.Timestamp(added)
+        except (ValueError, TypeError):
+            continue
+        mask.loc[mask.index < added_ts, ticker] = False
+
+    for rec in schedule.get("removals") or []:
+        ticker = str(rec.get("ticker", "")).strip()
+        removed = rec.get("date")
+        if ticker not in mask.columns or removed is None:
+            continue
+        try:
+            removed_ts = pd.Timestamp(removed)
+        except (ValueError, TypeError):
+            continue
+        mask.loc[mask.index > removed_ts, ticker] = False
+
     return mask
 
 # ---------------------------------------------------------------------------
@@ -378,13 +490,76 @@ def _validate_effective_weights(w_eff: pd.DataFrame) -> str | None:
     return None
 
 
-def _sharpe(daily_returns: pd.Series) -> float:
-    """Annualized Sharpe on daily returns (excess over daily RF)."""
+def load_rf(prices: pd.DataFrame) -> pd.Series:
+    """Daily risk-free rate series aligned to prices.index.
+
+    When USE_TIME_VARYING_RF is on, pulls ^IRX (13-week T-bill discount
+    rate) from a cached parquet (downloads on first call), converts the
+    annualized percentage to a daily simple rate, ffills across price
+    dates, and fills any head gaps with RISK_FREE_ANNUAL/252. When off,
+    returns a constant-valued series (RISK_FREE_ANNUAL/252 every day).
+    """
+    daily_const = RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR
+    if not USE_TIME_VARYING_RF:
+        return pd.Series(daily_const, index=prices.index, name="rf_daily")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if not RF_PARQUET.exists():
+        try:
+            import yfinance as yf
+            raw = yf.download(
+                tickers="^IRX",
+                start=START_DATE,
+                end=VAL_END_DATE,
+                interval=BARS,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if isinstance(raw.columns, pd.MultiIndex):
+                close = raw["Close"].iloc[:, 0] if "Close" in raw.columns.levels[0] else raw.iloc[:, 0]
+            else:
+                close = raw["Close"] if "Close" in raw.columns else raw.iloc[:, 0]
+            close = close.dropna()
+            if close.index.tz is not None:
+                close.index = close.index.tz_localize(None)
+            close.to_frame(name="irx").to_parquet(RF_PARQUET)
+        except Exception as e:
+            print(f"(load_rf: ^IRX download failed — {e}; falling back to flat RF)")
+            return pd.Series(daily_const, index=prices.index, name="rf_daily")
+
+    try:
+        df = pd.read_parquet(RF_PARQUET)
+        irx = df.iloc[:, 0]
+    except Exception:
+        return pd.Series(daily_const, index=prices.index, name="rf_daily")
+
+    # ^IRX is quoted as an annual discount rate in percentage points.
+    # Convert to daily simple rate: (annual_pct / 100) / 252.
+    rf_daily = (irx / 100.0) / TRADING_DAYS_PER_YEAR
+    rf_daily = rf_daily.reindex(prices.index).ffill().fillna(daily_const)
+    rf_daily.name = "rf_daily"
+    return rf_daily
+
+
+def _sharpe(daily_returns: pd.Series, daily_rf: pd.Series | float | None = None) -> float:
+    """Annualized Sharpe on daily returns (excess over daily RF).
+
+    `daily_rf` may be a pandas Series aligned on the same date index as
+    `daily_returns`, a scalar, or None (falls back to the flat
+    RISK_FREE_ANNUAL / 252).
+    """
     r = daily_returns.dropna()
     if len(r) < 2:
         return float("nan")
-    daily_rf = RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR
-    excess = r - daily_rf
+    if daily_rf is None:
+        rf = RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR
+        excess = r - rf
+    elif isinstance(daily_rf, pd.Series):
+        rf = daily_rf.reindex(r.index).fillna(RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR)
+        excess = r - rf
+    else:
+        excess = r - float(daily_rf)
     sigma = excess.std(ddof=1)
     if sigma == 0 or not np.isfinite(sigma):
         return float("nan")
@@ -425,6 +600,7 @@ def _bootstrap_sharpe_ci(
     block_days: int = BOOTSTRAP_BLOCK_DAYS,
     ci: float = BOOTSTRAP_CI,
     seed: int = BOOTSTRAP_SEED,
+    daily_rf: pd.Series | float | None = None,
 ) -> tuple[float, float]:
     """Stationary block bootstrap CI on annualized Sharpe.
 
@@ -442,7 +618,14 @@ def _bootstrap_sharpe_ci(
         return (float("nan"), float("nan"))
 
     rng = np.random.default_rng(seed)
-    daily_rf = RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR
+    if daily_rf is None:
+        rf_arr = np.full(n, RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR)
+    elif isinstance(daily_rf, pd.Series):
+        rf_arr = daily_rf.reindex(daily_returns.dropna().index).fillna(
+            RISK_FREE_ANNUAL / TRADING_DAYS_PER_YEAR
+        ).to_numpy()
+    else:
+        rf_arr = np.full(n, float(daily_rf))
     ann = math.sqrt(TRADING_DAYS_PER_YEAR)
     p_restart = 1.0 / block_days
 
@@ -455,7 +638,7 @@ def _bootstrap_sharpe_ci(
                 pos = int(rng.integers(0, n))
             idx[t] = pos
             pos = (pos + 1) % n
-        sample = r[idx] - daily_rf
+        sample = r[idx] - rf_arr[idx]
         sigma = sample.std(ddof=1)
         if sigma == 0 or not np.isfinite(sigma):
             sharpes[k] = np.nan
@@ -472,6 +655,34 @@ def _bootstrap_sharpe_ci(
     return (lo, hi)
 
 
+def _transaction_cost_series(
+    dw: pd.DataFrame, prices: pd.DataFrame
+) -> pd.Series:
+    """Daily transaction cost series.
+
+    Base rate: COST_BPS per side per unit |Δw|. When IMPACT_BPS_SLOPE > 0,
+    a per-name impact term is added: each name's bps is
+    COST_BPS + IMPACT_BPS_SLOPE * vol_rank_pct, where vol_rank_pct is
+    that name's 63-day realized-vol percentile that day (cross-sectional
+    rank in [0,1]). Thin high-vol names pay more per trade, which is a
+    first-order correction toward realistic execution on biotech/small-cap
+    universes.
+    """
+    base = dw.sum(axis=1) * (COST_BPS / 10_000.0)
+    if IMPACT_BPS_SLOPE <= 0:
+        return base
+    vol_63d = prices.pct_change().rolling(63).std()
+    vol_rank = vol_63d.rank(axis=1, pct=True)  # (date × ticker), pct rank
+    bps_per_name = (COST_BPS + IMPACT_BPS_SLOPE * vol_rank) / 10_000.0
+    bps_per_name = bps_per_name.reindex(
+        index=dw.index, columns=dw.columns
+    ).fillna(COST_BPS / 10_000.0)
+    impact = (dw * bps_per_name).sum(axis=1)
+    # Subtract the base (which used flat COST_BPS) so we don't double-count
+    # the intercept — `impact` already includes the COST_BPS term.
+    return impact
+
+
 def strat_returns(weights: pd.DataFrame, prices: pd.DataFrame) -> pd.Series:
     """Compute the daily strategy return series using the same math as
     run_backtest (T+1 shift, costs, borrow), without the metric reporting.
@@ -485,7 +696,7 @@ def strat_returns(weights: pd.DataFrame, prices: pd.DataFrame) -> pd.Series:
     w_eff = w_raw.shift(1).fillna(0.0)
     rets = prices.pct_change().fillna(0.0)
     dw = w_eff.diff().abs().fillna(0.0)
-    tc = dw.sum(axis=1) * (COST_BPS / 10_000.0)
+    tc = _transaction_cost_series(dw, prices)
     short_exposure = (-w_eff.clip(upper=0.0)).sum(axis=1)
     borrow = short_exposure * ((BORROW_BPS_ANNUAL / 10_000.0) / TRADING_DAYS_PER_YEAR)
     return (w_eff * rets).sum(axis=1) - tc - borrow
@@ -544,10 +755,11 @@ def run_backtest(weights: pd.DataFrame, prices: pd.DataFrame) -> dict:
     # Per-name pnl = effective weight * asset return
     pnl_per_name = w_eff * rets
 
-    # Transaction cost: bps * |Δw| (summed across names), applied daily
+    # Transaction cost: per-name bps * |Δw|, summed across names (uses
+    # IMPACT_BPS_SLOPE when the env var is on, flat COST_BPS otherwise).
     dw = w_eff.diff().abs().fillna(0.0)
-    turnover_daily = dw.sum(axis=1)  # sum of |Δw_i| per day
-    tc = turnover_daily * (COST_BPS / 10_000.0)
+    turnover_daily = dw.sum(axis=1)  # sum of |Δw_i| per day (reported)
+    tc = _transaction_cost_series(dw, prices)
 
     # Borrow cost on shorts: (sum of negative weights, as a positive number) * daily borrow rate
     short_exposure = (-w_eff.clip(upper=0.0)).sum(axis=1)
@@ -557,38 +769,63 @@ def run_backtest(weights: pd.DataFrame, prices: pd.DataFrame) -> dict:
     strat_daily = pnl_per_name.sum(axis=1) - tc - borrow
     equity = (1.0 + strat_daily).cumprod()
 
+    # Time-varying risk-free rate (falls back to flat RISK_FREE_ANNUAL when
+    # USE_TIME_VARYING_RF is off). Sharpes below use this for excess returns.
+    rf_daily = load_rf(prices)
+
     # Slice into IS / OOS
     is_ret = train_slice(strat_daily)
     oos_ret = val_slice(strat_daily)
     oos_eq = val_slice(equity)
 
     # Metrics (OOS is the headline)
-    oos_sharpe = _sharpe(oos_ret)
-    is_sharpe = _sharpe(is_ret)
+    oos_sharpe = _sharpe(oos_ret, daily_rf=rf_daily)
+    is_sharpe = _sharpe(is_ret, daily_rf=rf_daily)
 
     # Per-calendar-year OOS Sharpe: decomposes the headline number so a
     # single-year driver (e.g. 2020 vol harvest) is visible to the reviewer.
     yearly_sharpe: dict[int, float] = {}
     if len(oos_ret):
         for year, group in oos_ret.groupby(oos_ret.index.year):
-            yearly_sharpe[int(year)] = _sharpe(group)
+            yearly_sharpe[int(year)] = _sharpe(group, daily_rf=rf_daily)
 
-    # Walk-forward per-fold Sharpes on the full strategy return series. Folds
-    # span 2014–2023 so they partially overlap the headline 2020–2024 OOS
-    # window — that's why the numbers are masked under SHOW_OOS=0 (revealing
-    # them would leak OOS info). A real edge should hold in most folds, not
-    # be driven by one 2-year regime.
+    # Walk-forward per-fold Sharpes with an embargo trim at each fold's
+    # start — see EMBARGO_DAYS constant. IS_FOLDS are entirely inside
+    # the training window (honest walk-forward); OOS_FOLDS are inside the
+    # headline OOS window (regime stability, NOT independent). The grader
+    # gates on IS_FOLDS median hard, OOS_FOLDS median soft.
+    def _fold_sharpe(f_start: str, f_end: str) -> float:
+        seg = strat_daily.loc[f_start:f_end]
+        if len(seg) <= EMBARGO_DAYS:
+            return float("nan")
+        return _sharpe(seg.iloc[EMBARGO_DAYS:], daily_rf=rf_daily)
+
     fold_sharpes: dict[str, float] = {}
-    for name, f_start, f_end in WALKFORWARD_FOLDS:
-        fold_sharpes[name] = _sharpe(strat_daily.loc[f_start:f_end])
-    fold_finite = [s for s in fold_sharpes.values() if np.isfinite(s)]
-    median_fold_sharpe = float(np.median(fold_finite)) if fold_finite else float("nan")
-    min_fold_sharpe = float(min(fold_finite)) if fold_finite else float("nan")
+    is_fold_sharpes: dict[str, float] = {}
+    oos_fold_sharpes: dict[str, float] = {}
+    for name, f_start, f_end in IS_FOLDS:
+        s = _fold_sharpe(f_start, f_end)
+        is_fold_sharpes[name] = s
+        fold_sharpes[name] = s
+    for name, f_start, f_end in OOS_FOLDS:
+        s = _fold_sharpe(f_start, f_end)
+        oos_fold_sharpes[name] = s
+        fold_sharpes[name] = s
+
+    def _median_min(d: dict[str, float]) -> tuple[float, float]:
+        finite = [v for v in d.values() if np.isfinite(v)]
+        if not finite:
+            return (float("nan"), float("nan"))
+        return (float(np.median(finite)), float(min(finite)))
+
+    median_fold_sharpe, min_fold_sharpe = _median_min(fold_sharpes)
+    is_fold_median_sharpe, is_fold_min_sharpe = _median_min(is_fold_sharpes)
+    oos_fold_median_sharpe, oos_fold_min_sharpe = _median_min(oos_fold_sharpes)
 
     # Block-bootstrap CI on OOS Sharpe: how wide is the noise band around
     # the point estimate? A 0.42 → 0.51 "improvement" often lives inside
     # this interval, so the agent's keep rule tightens to `lo > running_best`.
-    oos_sharpe_lo, oos_sharpe_hi = _bootstrap_sharpe_ci(oos_ret)
+    oos_sharpe_lo, oos_sharpe_hi = _bootstrap_sharpe_ci(oos_ret, daily_rf=rf_daily)
     annual_return = _annualize_return(oos_ret)
     annual_vol = _annualize_vol(oos_ret)
     max_dd = _max_drawdown(oos_eq)
@@ -634,6 +871,17 @@ def run_backtest(weights: pd.DataFrame, prices: pd.DataFrame) -> dict:
         "fold_sharpes": {k: float(v) for k, v in fold_sharpes.items()},
         "median_fold_sharpe": median_fold_sharpe,
         "min_fold_sharpe": min_fold_sharpe,
+        "is_fold_sharpes": {k: float(v) for k, v in is_fold_sharpes.items()},
+        "oos_fold_sharpes": {k: float(v) for k, v in oos_fold_sharpes.items()},
+        "is_fold_median_sharpe": is_fold_median_sharpe,
+        "is_fold_min_sharpe": is_fold_min_sharpe,
+        "oos_fold_median_sharpe": oos_fold_median_sharpe,
+        "oos_fold_min_sharpe": oos_fold_min_sharpe,
+        # Serialized OOS daily-return series so the grader can paired-test
+        # (Jobson-Korkie/Memmel) against the baseline's OOS returns.
+        "oos_daily_returns_json": oos_ret.to_json(
+            orient="split", date_format="iso", date_unit="s"
+        ),
     }
 
 
@@ -656,6 +904,13 @@ def _crash_result(t_start: float, reason: str) -> dict:
         "fold_sharpes": {},
         "median_fold_sharpe": float("nan"),
         "min_fold_sharpe": float("nan"),
+        "is_fold_sharpes": {},
+        "oos_fold_sharpes": {},
+        "is_fold_median_sharpe": float("nan"),
+        "is_fold_min_sharpe": float("nan"),
+        "oos_fold_median_sharpe": float("nan"),
+        "oos_fold_min_sharpe": float("nan"),
+        "oos_daily_returns_json": "",
     }
 
 # ---------------------------------------------------------------------------
@@ -682,6 +937,13 @@ OOS_LOG_HEADER = [
     "median_fold_sharpe",
     "min_fold_sharpe",
     "fold_sharpes_json",
+    "is_fold_median_sharpe",
+    "is_fold_min_sharpe",
+    "oos_fold_median_sharpe",
+    "oos_fold_min_sharpe",
+    "is_fold_sharpes_json",
+    "oos_fold_sharpes_json",
+    "oos_daily_returns_json",
 ]
 
 
@@ -744,6 +1006,13 @@ def _append_oos_log(results: dict) -> None:
             f"{results.get('median_fold_sharpe', float('nan')):.6f}",
             f"{results.get('min_fold_sharpe', float('nan')):.6f}",
             json.dumps(results.get("fold_sharpes", {})),
+            f"{results.get('is_fold_median_sharpe', float('nan')):.6f}",
+            f"{results.get('is_fold_min_sharpe', float('nan')):.6f}",
+            f"{results.get('oos_fold_median_sharpe', float('nan')):.6f}",
+            f"{results.get('oos_fold_min_sharpe', float('nan')):.6f}",
+            json.dumps(results.get("is_fold_sharpes", {})),
+            json.dumps(results.get("oos_fold_sharpes", {})),
+            results.get("oos_daily_returns_json", ""),
         ]
         with open(OOS_RESULTS_TSV, "a", encoding="utf-8", newline="") as f:
             if new_file:
@@ -803,6 +1072,26 @@ def print_summary(results: dict) -> None:
     mn = results.get("min_fold_sharpe", float("nan"))
     print(f"median_fold_sharpe: {oos(med, '{:.6f}')}")
     print(f"min_fold_sharpe:    {oos(mn, '{:.6f}')}")
+    # Split IS-fold and OOS-fold summaries. IS-fold numbers are honest
+    # walk-forward (2014-2019, inside training window); OOS-fold numbers
+    # are sub-windows of 2020-2024 and leak OOS info, so they are masked
+    # under SHOW_OOS=0.
+    is_med = results.get("is_fold_median_sharpe", float("nan"))
+    is_mn = results.get("is_fold_min_sharpe", float("nan"))
+    # IS-fold medians are computed on IS-only data, so reveal them even
+    # under SHOW_OOS=0 — they are honest IS robustness signal.
+    if math.isfinite(is_med):
+        print(f"is_fold_median_sharpe: {is_med:.6f}")
+    else:
+        print("is_fold_median_sharpe: nan")
+    if math.isfinite(is_mn):
+        print(f"is_fold_min_sharpe:    {is_mn:.6f}")
+    else:
+        print("is_fold_min_sharpe:    nan")
+    oos_med = results.get("oos_fold_median_sharpe", float("nan"))
+    oos_mn = results.get("oos_fold_min_sharpe", float("nan"))
+    print(f"oos_fold_median_sharpe: {oos(oos_med, '{:.6f}')}")
+    print(f"oos_fold_min_sharpe:    {oos(oos_mn, '{:.6f}')}")
     # status_hint is informational only; the grader (log_result.py) applies
     # the real keep/discard rule.
     print(f"status_hint:      {results['status_hint']}")

@@ -32,7 +32,11 @@ def _load_results(path: Path | str) -> pd.DataFrame | None:
     if not p.exists() or p.stat().st_size == 0:
         return None
     try:
-        df = pd.read_csv(p, sep="\t")
+        # Hex commits parse as scientific notation under default inference.
+        df = pd.read_csv(
+            p, sep="\t",
+            dtype={"commit": str, "status": str, "description": str},
+        )
     except pd.errors.EmptyDataError:
         return None
     if "status" not in df.columns or "commit" not in df.columns:
@@ -48,7 +52,10 @@ def _side_channel() -> pd.DataFrame | None:
     if not OOS_RESULTS_TSV.exists() or OOS_RESULTS_TSV.stat().st_size == 0:
         return None
     try:
-        side = pd.read_csv(OOS_RESULTS_TSV, sep="\t")
+        side = pd.read_csv(
+            OOS_RESULTS_TSV, sep="\t",
+            dtype={"commit": str, "status_hint": str},
+        )
     except pd.errors.EmptyDataError:
         return None
     if "commit" not in side.columns or "oos_sharpe" not in side.columns:
