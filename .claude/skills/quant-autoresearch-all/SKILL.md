@@ -1,6 +1,6 @@
 ---
 name: quant-autoresearch-all
-description: Use when the user asks to run autoresearch across ALL universes (sp100, sp400, sp500, ndx100, xbi_2026) or any multi-universe subset in parallel. Spawns one general-purpose subagent per universe, each running the `quant-autoresearch` skill end-to-end in its own git worktree with a pre-assigned unique timestamp tag. Default is all five known universes; pass a comma-separated subset to narrow. Triggers on phrases like "all possible universes", "run autoresearch on all universes", "every universe in parallel", "sp100/sp400/sp500/ndx100/xbi".
+description: Use when the user asks to run autoresearch across ALL universes (sp100, sp400, sp500, ndx100, xbi_2026, gdxj_2026, xlk_2026) or any multi-universe subset in parallel. Spawns one general-purpose subagent per universe, each running the `quant-autoresearch` skill end-to-end in its own git worktree with a pre-assigned unique timestamp tag. Default is all seven known universes; pass a comma-separated subset to narrow. Triggers on phrases like "all possible universes", "run autoresearch on all universes", "every universe in parallel", "sp100/sp400/sp500/ndx100/xbi/gdxj/xlk".
 ---
 
 # quant-autoresearch-all
@@ -9,13 +9,15 @@ Fan out the `quant-autoresearch` skill across multiple universes in parallel. On
 
 ## Default universes
 
-Unless the invoker names a subset, run all five:
+Unless the invoker names a subset, run all seven:
 
 - `sp100_2024`
 - `sp400_2024`
 - `sp500_2024`
 - `ndx100_2024`
 - `xbi_2026`
+- `gdxj_2026`
+- `xlk_2026`
 
 A subset can be passed as a comma-separated list (e.g. `sp100,sp500`). Normalize to the full `<tag>_<year>` form using the `universe_<tag>.json` files present in the repo root — if the bare name is ambiguous (e.g. `sp400` → `sp400_2024`), always prefer the most recent year present.
 
