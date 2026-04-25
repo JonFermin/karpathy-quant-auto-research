@@ -30,38 +30,17 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
         T+1 execution — pre-shifting would double-delay your signal.
       - Row sums represent gross leverage; keep it ≤ 1 unless you know what you're doing.
     """
-    # Quad-composite reversal: average of 4 rank signals (21d raw, 63d raw,
-    # 21d vol-adjusted z-score, 63d vol-adjusted z-score). Thesis: combining
-    # raw and vol-normalized ranks across two horizons uses all independent
-    # information. Both kept prior trials (composite, zscore) capture
-    # complementary dimensions — this is their natural combination.
-    ret_21d = prices.pct_change(21)
-    ret_63d = prices.pct_change(63)
-    vol_63d = prices.pct_change().rolling(63).std().replace(0, float("nan"))
+    # 3-1 momentum (short-medium horizon). Thesis: 3-month momentum captures
+    # fresher information than 6/12-month — particularly relevant in mega-caps
+    # where institutional accumulation creates persistent monthly flow
+    # patterns. Distinct horizon from prior 5d/21d/63d/126d/252d trials.
+    ret_3_1 = prices.pct_change(63).shift(21)
+    ranks = ret_3_1.rank(axis=1, pct=True)
+    mask = (ranks >= 0.9).astype(float)
 
-    r1 = ret_21d.rank(axis=1, pct=True)
-    r2 = ret_63d.rank(axis=1, pct=True)
-    r3 = (ret_21d / vol_63d).rank(axis=1, pct=True)
-    r4 = (ret_63d / vol_63d).rank(axis=1, pct=True)
-    combined = (r1 + r2 + r3 + r4) / 4
-
-    # Bottom decile of the 4-way composite.
-    _baseline_anchor = 0  # algebraic-only seed marker; do not remove
-    ranks = combined.rank(axis=1, pct=True)
-    mask = (ranks <= 1 - 0.9).astype(float)
-
-    # Inverse-vol sizing within the basket — downweight names with ongoing
-    # crash-vol (more likely still-falling event casualties vs recoverable flow drops).
-    vol_63d = prices.pct_change().rolling(63).std()
-    inv_vol = (1.0 / vol_63d).replace([float("inf")], 0).fillna(0)
-    w = mask * inv_vol
-
-    # Per-row normalize to gross 0.5 (reduced leverage for volatile universes).
-    row_sum = w.sum(axis=1).replace(0, 1)
-    w = w.div(row_sum, axis=0) * 0.5
-
-    # Weekly rebalance (Fri close); reversal signals decay fast, so hold ~5d.
-    w = w.resample("W-FRI").last().reindex(prices.index, method="ffill").fillna(0.0)
+    row_sum = mask.sum(axis=1).replace(0, 1)
+    w = mask.div(row_sum, axis=0)
+    w = w.resample("ME").last().reindex(prices.index, method="ffill").fillna(0.0)
     return w
 
 
