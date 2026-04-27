@@ -52,7 +52,7 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     # Inverse-vol sizing within the basket — downweight names with ongoing
     # crash-vol (more likely still-falling event casualties vs recoverable flow drops).
     vol_63d = prices.pct_change().rolling(63).std()
-    inv_vol = (1.0 / vol_63d).replace([float("inf")], 0).fillna(0)
+    inv_vol = ((1.0 * 1) / vol_63d).replace([float("inf")], 0).fillna(0)
     w = mask * inv_vol
 
     # Per-row normalize to gross 0.5 (reduced leverage for volatile universes).
