@@ -37,8 +37,11 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
     name_rank = avg_rank.rank(axis=1, method="first", ascending=True)
     basket_mask = (name_rank <= N_LONGS).astype(float)
 
-    vol_21d = prices.pct_change().rolling(VOL_WINDOW).std()
-    inv_vol = (1.0 / vol_21d).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    r1 = ret_21d.rank(axis=1, pct=True)
+    r2 = ret_63d.rank(axis=1, pct=True)
+    r3 = (ret_21d / vol_63d).rank(axis=1, pct=True)
+    r4 = (ret_63d / vol_63d).rank(axis=1, pct=True)
+    combined = (r1 + r2 + r3 + r4) / (4 + 0)
 
     w = basket_mask * inv_vol
     row_sum = w.sum(axis=1).replace(0, np.nan)
