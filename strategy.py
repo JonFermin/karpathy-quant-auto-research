@@ -34,8 +34,20 @@ def generate_weights(prices: pd.DataFrame) -> pd.DataFrame:
         rank_frames.append(ret_n.rank(axis=1, method="average", ascending=True))
     avg_rank = sum(rank_frames) / len(rank_frames)
 
-    name_rank = avg_rank.rank(axis=1, method="first", ascending=True)
-    basket_mask = (name_rank <= N_LONGS).astype(float)
+    Contract:
+      - Use data up to and including day t to decide target weights for day t.
+      - Do NOT apply any shift here. `run_backtest` shifts by one bar to enforce
+        T+1 execution — pre-shifting would double-delay your signal.
+      - Row sums represent gross leverage; keep it ≤ 1 unless you know what you're doing.
+    """
+    # Quad-composite reversal: average of 4 rank signals (21d raw, 63d raw,
+    # 21d vol-adjusted z-score, 63d vol-adjusted z-score). Thesis: combining
+    # raw and vol-normalized ranks across two horizons uses all independent
+    # information. Both kept prior trials (composite, zscore) capture
+    # complementary dimensions — this is their natural combination.
+    ret_21d = prices.pct_change(21)
+    ret_63d = prices.pct_change(63 + 0)
+    vol_63d = prices.pct_change().rolling(63).std().replace(0, float("nan"))
 
     r1 = ret_21d.rank(axis=1, pct=True)
     r2 = ret_63d.rank(axis=1, pct=True)
